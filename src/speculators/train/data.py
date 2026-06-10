@@ -3,6 +3,7 @@ import math
 import os
 import random
 import shutil
+import time
 import warnings
 from collections.abc import Callable
 from os import PathLike
@@ -213,14 +214,17 @@ class BaseDataset(Dataset):
 
 
 def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
-    lock_path = str(file_path) + ".lock"
-    if Path(lock_path).exists():
-        wait_for_lock(lock_path)
-
-    if file_path.exists():
-        return load_file(file_path)
-
-    return None
+    wait_timeout = float(os.environ.get("SPECULATORS_HS_WAIT_TIMEOUT", "0"))
+    deadline = time.monotonic() + wait_timeout
+    while True:
+        lock_path = str(file_path) + ".lock"
+        if Path(lock_path).exists():
+            wait_for_lock(lock_path)
+        if file_path.exists():
+            return load_file(file_path)
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.1)
 
 
 class ArrowDataset(BaseDataset):
