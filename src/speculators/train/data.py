@@ -219,7 +219,10 @@ def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
     while True:
         lock_path = str(file_path) + ".lock"
         if Path(lock_path).exists():
-            wait_for_lock(lock_path)
+            try:
+                wait_for_lock(lock_path)
+            except FileNotFoundError:
+                pass
         if file_path.exists():
             return load_file(file_path)
         if time.monotonic() >= deadline:
