@@ -242,9 +242,14 @@ class HiddenStatePrefetcher:
     Instead of each DataLoader worker synchronously calling vLLM and waiting for
     the file to arrive (convoy collapse on the transfer pipe), this prefetcher
     runs in a separate thread with an asyncio event loop, firing concurrent
-    requests. It moves resulting files to candidate_path (hs_{idx}.safetensors)
-    so DataLoader workers — which run in forked subprocesses — find them via
-    the existing _maybe_load_hs_file polling.
+    requests. It atomically renames resulting files to candidate_path
+    (hs_{idx}.safetensors) so DataLoader workers — which run in forked
+    subprocesses — find them via the existing _maybe_load_hs_file polling.
+
+    On multi-node, vLLM writes the file on Node A and the Erlang sidecar
+    transfers it to the same path on Node B. The prefetcher polls for the
+    file to appear locally (using async sleep, never blocking the event loop)
+    then renames it to candidate_path.
     """
 
     def __init__(
@@ -276,6 +281,9 @@ class HiddenStatePrefetcher:
     def set_epoch(self, epoch: int):
         self._epoch = epoch
         self._epoch_changed.set()
+
+    def _epoch_is_stale(self, epoch: int) -> bool:
+        return self._epoch != epoch or self._stop.is_set()
 
     def _run(self):
         loop = asyncio.new_event_loop()
@@ -318,10 +326,10 @@ class HiddenStatePrefetcher:
                 epoch, len(all_indices), self.prefetch_ahead, self.max_concurrent,
             )
 
-            pending: list[asyncio.Task] = []
+            pending: set[asyncio.Task] = set()
 
             for idx in all_indices:
-                if self._stop.is_set():
+                if self._epoch_is_stale(epoch):
                     break
 
                 file_idx = self.dataset._map_to_file_idx(idx)
@@ -332,25 +340,30 @@ class HiddenStatePrefetcher:
                     continue
 
                 while len(pending) >= self.prefetch_ahead:
-                    if self._stop.is_set():
+                    if self._epoch_is_stale(epoch):
                         break
-                    done = [t for t in pending if t.done()]
-                    for t in done:
-                        pending.remove(t)
+                    done = {t for t in pending if t.done()}
+                    pending -= done
                     if len(pending) >= self.prefetch_ahead:
                         await asyncio.sleep(0.05)
 
-                pending.append(asyncio.create_task(
-                    self._prefetch_one(idx, sem)
+                pending.add(asyncio.create_task(
+                    self._prefetch_one(idx, epoch, sem)
                 ))
 
             if pending:
                 await asyncio.gather(*pending, return_exceptions=True)
 
-            prefetch_logger.info("Epoch %d: prefetch pass complete", epoch)
+            if not self._epoch_is_stale(epoch):
+                prefetch_logger.info("Epoch %d: prefetch pass complete", epoch)
 
-    async def _prefetch_one(self, index: int, sem: asyncio.Semaphore):
+    async def _prefetch_one(
+        self, index: int, epoch: int, sem: asyncio.Semaphore
+    ):
         async with sem:
+            if self._epoch_is_stale(epoch):
+                return
+
             dataset_item = self.dataset.data[index]
             client_item = build_client_item(dataset_item)
             try:
@@ -361,19 +374,29 @@ class HiddenStatePrefetcher:
                     timeout=self.dataset.request_timeout,
                     max_retries=self.dataset.max_retries,
                 )
+
                 file_idx = self.dataset._map_to_file_idx(index)
                 candidate = (
                     self.dataset.hidden_states_path / f"hs_{file_idx}.safetensors"
                 )
                 hs_path = Path(hs_filepath)
-                if hs_path.exists():
-                    shutil.move(hs_filepath, candidate)
-                else:
-                    loaded = _maybe_load_hs_file(hs_path)
-                    if loaded is None:
+
+                poll_timeout = self.dataset.request_timeout or 120.0
+                poll_deadline = time.monotonic() + poll_timeout
+                while not hs_path.exists():
+                    if self._epoch_is_stale(epoch):
+                        return
+                    if time.monotonic() >= poll_deadline:
                         prefetch_logger.debug(
-                            "Prefetch: file never appeared for index %d", index
+                            "Prefetch: file never appeared for index %d at %s",
+                            index, hs_filepath,
                         )
+                        return
+                    await asyncio.sleep(0.1)
+
+                tmp_path = candidate.with_suffix(".safetensors.tmp")
+                os.rename(hs_filepath, tmp_path)
+                os.rename(tmp_path, candidate)
             except Exception as e:
                 prefetch_logger.debug(
                     "Prefetch failed for index %d: %s", index, e
