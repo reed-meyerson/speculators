@@ -452,6 +452,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        prefetch_ahead=args.prefetch_ahead,
     )
 
     # Get trainer kwargs from model class
