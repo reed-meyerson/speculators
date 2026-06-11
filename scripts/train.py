@@ -101,10 +101,12 @@ def setup_dataloader(
     )
 
     if prefetch_ahead > 0 and isinstance(dataset, ArrowDataset):
+        per_rank_concurrent = max(1, 64 // max(world_size, 1))
         prefetcher = HiddenStatePrefetcher(
             dataset=dataset,
             batch_sampler=batch_sampler,
             prefetch_ahead=prefetch_ahead,
+            max_concurrent=per_rank_concurrent,
         )
         dataset.prefetcher = prefetcher
 

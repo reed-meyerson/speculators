@@ -219,8 +219,14 @@ class BaseDataset(Dataset):
         return data
 
 
-def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
-    wait_timeout = float(os.environ.get("SPECULATORS_HS_WAIT_TIMEOUT", "0"))
+def _maybe_load_hs_file(
+    file_path: Path, timeout: float | None = None
+) -> dict[str, torch.Tensor] | None:
+    wait_timeout = (
+        timeout
+        if timeout is not None
+        else float(os.environ.get("SPECULATORS_HS_WAIT_TIMEOUT", "0"))
+    )
     deadline = time.monotonic() + wait_timeout
     while True:
         lock_path = str(file_path) + ".lock"
@@ -521,7 +527,8 @@ class ArrowDataset(BaseDataset):
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
         candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        loaded_hs = _maybe_load_hs_file(candidate_path)
+        prefetch_timeout = 10.0 if self.prefetcher is not None else None
+        loaded_hs = _maybe_load_hs_file(candidate_path, timeout=prefetch_timeout)
 
         if (
             loaded_hs is not None
