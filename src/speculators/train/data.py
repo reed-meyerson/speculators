@@ -1,8 +1,11 @@
+import asyncio
 import json
+import logging
 import math
 import os
 import random
 import shutil
+import threading
 import time
 import warnings
 from collections.abc import Callable
@@ -22,9 +25,12 @@ from speculators.data_generation.vllm_client import (
     DEFAULT_REQUEST_TIMEOUT,
     ClientItem,
     generate_hidden_states,
+    generate_hidden_states_async,
     wait_for_lock,
 )
 from speculators.train.noise_transforms import TransformTensors
+
+prefetch_logger = logging.getLogger(__name__ + ".prefetcher")
 
 BatchType = dict[str, Any]
 
@@ -230,6 +236,150 @@ def _maybe_load_hs_file(file_path: Path) -> dict[str, torch.Tensor] | None:
         time.sleep(0.1)
 
 
+class HiddenStatePrefetcher:
+    """Background thread that fires vLLM hidden-state requests ahead of DataLoader.
+
+    Instead of each DataLoader worker synchronously calling vLLM and waiting for
+    the file to arrive (convoy collapse on the transfer pipe), this prefetcher
+    runs in a separate thread with an asyncio event loop, firing concurrent
+    requests. It moves resulting files to candidate_path (hs_{idx}.safetensors)
+    so DataLoader workers — which run in forked subprocesses — find them via
+    the existing _maybe_load_hs_file polling.
+    """
+
+    def __init__(
+        self,
+        dataset: "ArrowDataset",
+        batch_sampler,
+        prefetch_ahead: int,
+        max_concurrent: int = 64,
+    ):
+        self.dataset = dataset
+        self.batch_sampler = batch_sampler
+        self.prefetch_ahead = prefetch_ahead
+        self.max_concurrent = max_concurrent
+        self._epoch = 0
+        self._epoch_changed = threading.Event()
+        self._epoch_changed.set()
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._client: openai.AsyncOpenAI | None = None
+        self._model: str | None = None
+
+    def start(self):
+        self._thread.start()
+
+    def stop(self):
+        self._stop.set()
+        self._epoch_changed.set()
+
+    def set_epoch(self, epoch: int):
+        self._epoch = epoch
+        self._epoch_changed.set()
+
+    def _run(self):
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        try:
+            loop.run_until_complete(self._prefetch_loop())
+        except Exception:
+            prefetch_logger.exception("Prefetch loop crashed")
+        finally:
+            loop.close()
+
+    async def _setup_client(self):
+        self._client = openai.AsyncOpenAI(
+            base_url=self.dataset.vllm_endpoint, api_key="EMPTY"
+        )
+        list_models = await self._client.models.list()
+        self._model = list_models.data[0].id
+        prefetch_logger.info("Prefetcher connected to model: %s", self._model)
+
+    async def _prefetch_loop(self):
+        await self._setup_client()
+        sem = asyncio.Semaphore(self.max_concurrent)
+        current_epoch = -1
+
+        while not self._stop.is_set():
+            self._epoch_changed.wait(timeout=1.0)
+            if self._stop.is_set():
+                break
+            epoch = self._epoch
+            if epoch == current_epoch:
+                continue
+            current_epoch = epoch
+            self._epoch_changed.clear()
+
+            batches = self.batch_sampler._generate_batches(epoch)
+            all_indices = [idx for batch in batches for idx in batch]
+
+            prefetch_logger.info(
+                "Epoch %d: prefetching %d samples (ahead=%d, concurrent=%d)",
+                epoch, len(all_indices), self.prefetch_ahead, self.max_concurrent,
+            )
+
+            pending: list[asyncio.Task] = []
+
+            for idx in all_indices:
+                if self._stop.is_set():
+                    break
+
+                file_idx = self.dataset._map_to_file_idx(idx)
+                candidate = (
+                    self.dataset.hidden_states_path / f"hs_{file_idx}.safetensors"
+                )
+                if candidate.exists():
+                    continue
+
+                while len(pending) >= self.prefetch_ahead:
+                    if self._stop.is_set():
+                        break
+                    done = [t for t in pending if t.done()]
+                    for t in done:
+                        pending.remove(t)
+                    if len(pending) >= self.prefetch_ahead:
+                        await asyncio.sleep(0.05)
+
+                pending.append(asyncio.create_task(
+                    self._prefetch_one(idx, sem)
+                ))
+
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+            prefetch_logger.info("Epoch %d: prefetch pass complete", epoch)
+
+    async def _prefetch_one(self, index: int, sem: asyncio.Semaphore):
+        async with sem:
+            dataset_item = self.dataset.data[index]
+            client_item = build_client_item(dataset_item)
+            try:
+                hs_filepath = await generate_hidden_states_async(
+                    self._client,
+                    self._model,
+                    client_item,
+                    timeout=self.dataset.request_timeout,
+                    max_retries=self.dataset.max_retries,
+                )
+                file_idx = self.dataset._map_to_file_idx(index)
+                candidate = (
+                    self.dataset.hidden_states_path / f"hs_{file_idx}.safetensors"
+                )
+                hs_path = Path(hs_filepath)
+                if hs_path.exists():
+                    shutil.move(hs_filepath, candidate)
+                else:
+                    loaded = _maybe_load_hs_file(hs_path)
+                    if loaded is None:
+                        prefetch_logger.debug(
+                            "Prefetch: file never appeared for index %d", index
+                        )
+            except Exception as e:
+                prefetch_logger.debug(
+                    "Prefetch failed for index %d: %s", index, e
+                )
+
+
 class ArrowDataset(BaseDataset):
     def __init__(
         self,
@@ -281,6 +431,7 @@ class ArrowDataset(BaseDataset):
         self.model = model
         self.request_timeout = request_timeout
         self.max_retries = max_retries
+        self.prefetcher: HiddenStatePrefetcher | None = None
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -348,6 +499,16 @@ class ArrowDataset(BaseDataset):
         file_idx = self._map_to_file_idx(index)
         candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
         loaded_hs = _maybe_load_hs_file(candidate_path)
+
+        if (
+            loaded_hs is not None
+            and self.prefetcher is not None
+            and self.on_generate == "delete"
+        ):
+            try:
+                candidate_path.unlink()
+            except FileNotFoundError:
+                pass
 
         if loaded_hs is None:
             match self.on_missing:

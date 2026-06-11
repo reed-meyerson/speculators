@@ -25,6 +25,7 @@ from speculators.models.mtp.data import shift_batch_mtp
 from speculators.train.data import (
     ArrowDataset,
     BaseDataset,
+    HiddenStatePrefetcher,
     SampleFileDataset,
     create_collate_fn,
     split_files,
@@ -74,6 +75,7 @@ def setup_dataloader(
     num_workers: int = 12,
     prefetch_factor: int = 4,
     preprocess=None,
+    prefetch_ahead: int = 0,
 ) -> DataLoader:
     """Setup dataloader for training.
     Args:
@@ -86,6 +88,8 @@ def setup_dataloader(
         prefetch_factor: Dataloader prefetch factor.
         preprocess: Optional per-sample preprocessing function applied
             before collation (e.g. shift_batch for Eagle3).
+        prefetch_ahead: Number of samples to prefetch ahead via async vLLM
+            requests. 0 disables prefetching.
     Returns:
         DataLoader: Dataloader for training.
     """
@@ -95,6 +99,28 @@ def setup_dataloader(
         num_replicas=world_size,
         rank=local_rank,
     )
+
+    if prefetch_ahead > 0 and isinstance(dataset, ArrowDataset):
+        prefetcher = HiddenStatePrefetcher(
+            dataset=dataset,
+            batch_sampler=batch_sampler,
+            prefetch_ahead=prefetch_ahead,
+        )
+        dataset.prefetcher = prefetcher
+
+        original_set_epoch = batch_sampler.set_epoch
+
+        def _set_epoch_with_prefetch(epoch: int):
+            original_set_epoch(epoch)
+            prefetcher.set_epoch(epoch)
+
+        batch_sampler.set_epoch = _set_epoch_with_prefetch  # type: ignore[method-assign]
+        prefetcher.start()
+        logger.info(
+            "Started HiddenStatePrefetcher (ahead=%d) for rank %d",
+            prefetch_ahead, local_rank,
+        )
+
     return DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -414,6 +440,7 @@ def main(args: argparse.Namespace):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
+        prefetch_ahead=args.prefetch_ahead,
     )
     val_loader = setup_dataloader(
         val_dataset,
@@ -777,6 +804,17 @@ def parse_args():
     )
     parser.add_argument(
         "--prefetch-factor", type=int, default=4, help="Dataloader prefetch factor"
+    )
+    parser.add_argument(
+        "--prefetch-ahead",
+        type=int,
+        default=0,
+        help=(
+            "Number of samples to prefetch ahead of DataLoader consumption "
+            "via concurrent async vLLM requests from a background thread. "
+            "0 (default) disables prefetching. Only effective with "
+            "--on-missing=generate. Recommended: 64-256 for multi-node."
+        ),
     )
     parser.add_argument(
         "--noise-std",
