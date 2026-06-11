@@ -378,22 +378,12 @@ class HiddenStatePrefetcher:
                 )
                 hs_path = Path(hs_filepath)
 
-                poll_timeout = self.dataset.request_timeout or 120.0
-                poll_deadline = time.monotonic() + poll_timeout
-                while not hs_path.exists():
-                    if self._epoch_is_stale(epoch):
-                        return
-                    if time.monotonic() >= poll_deadline:
-                        prefetch_logger.debug(
-                            "Prefetch: file never appeared for index %d at %s",
-                            index, hs_filepath,
-                        )
-                        return
-                    await asyncio.sleep(0.1)
-
-                tmp_path = candidate.with_suffix(".safetensors.tmp")
-                os.rename(hs_filepath, tmp_path)
-                os.rename(tmp_path, candidate)
+                if hs_path.exists():
+                    os.rename(hs_filepath, str(candidate))
+                else:
+                    hint_dir = self.dataset.hidden_states_path / ".rename"
+                    hint_dir.mkdir(exist_ok=True)
+                    (hint_dir / hs_path.name).write_text(str(file_idx))
             except Exception as e:
                 prefetch_logger.debug(
                     "Prefetch failed for index %d: %s", index, e
@@ -518,8 +508,7 @@ class ArrowDataset(BaseDataset):
     def _get_raw_data(self, index):
         file_idx = self._map_to_file_idx(index)
         candidate_path = self.hidden_states_path / f"hs_{file_idx}.safetensors"
-        prefetch_timeout = 10.0 if self.prefetcher is not None else None
-        loaded_hs = _maybe_load_hs_file(candidate_path, timeout=prefetch_timeout)
+        loaded_hs = _maybe_load_hs_file(candidate_path)
 
         if (
             loaded_hs is not None
