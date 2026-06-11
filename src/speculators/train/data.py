@@ -333,15 +333,14 @@ class HiddenStatePrefetcher:
             )
 
             pending: set[asyncio.Task] = set()
+            hs_dir = self.dataset.hidden_states_path
 
             for idx in all_indices:
                 if self._epoch_is_stale(epoch):
                     break
 
                 file_idx = self.dataset._map_to_file_idx(idx)
-                candidate = (
-                    self.dataset.hidden_states_path / f"hs_{file_idx}.safetensors"
-                )
+                candidate = hs_dir / f"hs_{file_idx}.safetensors"
                 if candidate.exists():
                     continue
 
@@ -352,6 +351,19 @@ class HiddenStatePrefetcher:
                     pending -= done
                     if len(pending) >= self.prefetch_ahead:
                         await asyncio.sleep(0.05)
+
+                files_on_disk = sum(
+                    1 for f in hs_dir.iterdir()
+                    if f.suffix == ".safetensors" and not f.name.endswith(".tmp")
+                ) if hs_dir.exists() else 0
+                while files_on_disk >= self.prefetch_ahead:
+                    if self._epoch_is_stale(epoch):
+                        break
+                    await asyncio.sleep(0.5)
+                    files_on_disk = sum(
+                        1 for f in hs_dir.iterdir()
+                        if f.suffix == ".safetensors" and not f.name.endswith(".tmp")
+                    ) if hs_dir.exists() else 0
 
                 pending.add(asyncio.create_task(
                     self._prefetch_one(idx, epoch, sem)
