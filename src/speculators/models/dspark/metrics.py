@@ -25,6 +25,7 @@ from speculators.losses import (
     dpace_loss_decay,
     tv_loss,
 )
+from speculators.losses.targets import as_target_ids
 from speculators.models.metrics import (
     compute_accepted_length_counts,
     compute_accuracy_multi_step,
@@ -158,7 +159,7 @@ def compute_metrics(
 
     # Per-position greedy accuracy
     pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
+    target_ids = as_target_ids(targets)
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )

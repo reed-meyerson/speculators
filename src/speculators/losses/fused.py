@@ -30,6 +30,9 @@ import torch
 import triton
 import triton.language as tl
 
+from speculators.losses import eager
+from speculators.losses.targets import is_hard
+
 MAX_FUSED_SIZE = 131072
 # Ascend NPU's Unified Buffer (~192 KB) cannot fit the double-row load these
 # kernels perform (logits + targets per block) beyond 4096 elements per block;
@@ -317,12 +320,23 @@ def fused_js_div_loss(logits, targets):
 
 
 def fused_ce_loss(logits, targets):
-    """Per-position CE vs argmax(targets) ``[1, T]``; fused twin of ``ce_loss``."""
+    """Per-position CE vs argmax(targets) ``[1, T]``; fused twin of ``ce_loss``.
+
+    Hard targets route to the eager implementation: the kernel exists to avoid
+    materializing the dense target softmax, which token ids never need.
+    """
+    if is_hard(targets):
+        return eager.ce_loss(logits, targets)
     return _FusedLoss.apply(logits, targets, _OP_CE.value)
 
 
 def fused_tv_loss(logits, targets):
-    """Per-position TV distance ``[1, T]`` from draft/target logits (fused Triton)."""
+    """Per-position TV distance ``[1, T]`` from draft/target logits (fused Triton).
+
+    Hard targets route to the eager implementation; see ``fused_ce_loss``.
+    """
+    if is_hard(targets):
+        return eager.tv_loss(logits, targets)
     return _FusedLoss.apply(logits, targets, _OP_TV.value)
 
 

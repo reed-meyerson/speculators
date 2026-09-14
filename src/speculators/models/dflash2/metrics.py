@@ -18,6 +18,7 @@ from speculators.losses import (
     loss_function,
     tv_loss,
 )
+from speculators.losses.targets import as_target_ids, is_hard
 from speculators.models.dspark.metrics import compute_metrics as compute_unary_metrics
 from speculators.models.metrics import compute_accepted_length_counts
 
@@ -167,7 +168,7 @@ def compute_metrics(
     metrics["loss_total"] = one.clone()
 
     with torch.no_grad():
-        target_ids = targets.argmax(dim=-1)
+        target_ids = as_target_ids(targets)
         valid = loss_mask.to(torch.bool)
         valid_float = valid.to(unary_logits.dtype)
         valid_total = valid_float.sum()
@@ -177,11 +178,16 @@ def compute_metrics(
         ).sum()
         metrics[f"unary_candidate_recall_at_{top_k}_total"] = valid_total
 
-        target_log_normalizer = torch.logsumexp(targets.float(), dim=-1)
-        candidate_target_logits = targets.gather(-1, training_candidate_ids).float()
-        candidate_mass = torch.exp(
-            torch.logsumexp(candidate_target_logits, dim=-1) - target_log_normalizer
-        )
+        if is_hard(targets):
+            # A point mass puts all of its weight on the one true token, so the
+            # mass the candidates cover is exactly whether they contain it.
+            candidate_mass = contains_target.to(unary_logits.dtype)
+        else:
+            target_log_normalizer = torch.logsumexp(targets.float(), dim=-1)
+            candidate_target_logits = targets.gather(-1, training_candidate_ids).float()
+            candidate_mass = torch.exp(
+                torch.logsumexp(candidate_target_logits, dim=-1) - target_log_normalizer
+            )
         metrics[f"unary_candidate_target_mass_at_{top_k}_sum"] = (
             candidate_mass * valid_float
         ).sum()

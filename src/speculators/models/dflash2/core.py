@@ -5,6 +5,7 @@ import torch
 from transformers import PretrainedConfig
 
 from speculators.losses import LossConfig, kl_div_loss, resolve_loss_config, tv_loss
+from speculators.losses.targets import as_target_ids
 from speculators.model import SpeculatorModel
 from speculators.models.dflash.config import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
@@ -91,10 +92,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             selector_rank=kwargs.get("selector_rank", 256),
             selector_top_k=kwargs.get("selector_top_k", 16),
         )
-        model = cls(config=config)
-        model.load_vocab_mappings(t2d, d2t)
-        model.load_verifier_weights()
-        return model
+        return cls._finalize_training_model(config, t2d, d2t, **kwargs)
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
@@ -112,6 +110,7 @@ class DFlash2DraftModel(DFlashDraftModel):
             ),
             "dpace_alpha": kwargs.get("dpace_alpha", 0.5),
             "selector_loss_alpha": kwargs.get("selector_loss_alpha", 1.0),
+            "training_mode": kwargs.get("training_mode", "distill"),
         }
         return dict(shared), dict(shared)
 
@@ -131,11 +130,11 @@ class DFlash2DraftModel(DFlashDraftModel):
     @conditional_torch_compile
     def forward(
         self,
-        hidden_states: torch.Tensor,  # shape: [1, total_seq_len,num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, seq, num_hidden*hidden_size]
+        input_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        loss_mask: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, seq, hidden]
+        document_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         loss_config: LossConfig | None = None,
         tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
@@ -160,7 +159,7 @@ class DFlash2DraftModel(DFlashDraftModel):
         )
         predecessor_ids = self._predecessor_ids(input_ids, block_indices)
 
-        target_ids = targets.argmax(dim=-1)
+        target_ids = as_target_ids(targets)
         # shape: [1, num_anchors*block_size]
         candidate_ids = unary_logits.topk(self.candidate_selector.top_k, dim=-1).indices
         # shape: [1, num_anchors*block_size, top_k]

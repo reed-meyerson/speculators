@@ -88,10 +88,7 @@ class DSparkDraftModel(DFlashDraftModel):
             ),
         )
 
-        model = cls(config=config)
-        model.load_vocab_mappings(t2d, d2t)
-        model.load_verifier_weights()
-        return model
+        return cls._finalize_training_model(config, t2d, d2t, **kwargs)
 
     @staticmethod
     def get_trainer_kwargs(**kwargs) -> tuple[dict, dict]:
@@ -114,17 +111,18 @@ class DSparkDraftModel(DFlashDraftModel):
             "confidence_head_alpha": confidence_head_alpha,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "training_mode": kwargs.get("training_mode", "distill"),
         }
         return dict(shared), dict(shared)
 
     @conditional_torch_compile
     def forward(
         self,
-        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # [1, total_seq_len]
-        loss_mask: torch.Tensor,  # [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
-        document_ids: torch.Tensor,  # [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, seq, num_hidden*hidden_size]
+        input_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        loss_mask: torch.Tensor | None = None,  # [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, seq, hidden]
+        document_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         loss_config: LossConfig | None = None,
         tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,

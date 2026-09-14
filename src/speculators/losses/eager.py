@@ -5,6 +5,8 @@ import math
 
 import torch
 
+from speculators.losses.targets import IGNORE_INDEX, as_target_ids, is_hard
+
 _NLA_EPS = 1e-5
 
 
@@ -91,25 +93,27 @@ def js_div_loss(
 
 def ce_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
-    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size] or [1, seq_len]
 ):
-    """Compute per-position cross-entropy loss using argmax of target logits as labels.
+    """Compute per-position cross-entropy loss against hard token-id labels.
 
     Args:
         logits: Draft model logits.
-        targets: Target model logits (argmax taken to produce hard labels).
+        targets: Either target model logits (argmax taken to produce hard
+            labels) or token ids that are already hard labels. Ids equal to
+            ``-100`` are ignored, so callers may mark unlearnable positions.
 
     Returns:
         Per-position cross-entropy loss with shape [1, seq_len].
     """
     batch_size, seq_len, draft_vocab_size = logits.shape
-    target_ids = torch.argmax(targets, dim=-1)  # shape: [1, seq_len]
+    target_ids = as_target_ids(targets)  # shape: [1, seq_len]
 
     elementwise_loss = torch.nn.functional.cross_entropy(
         logits.reshape(-1, draft_vocab_size),
         target_ids.reshape(-1),
         reduction="none",
-        ignore_index=-100,
+        ignore_index=IGNORE_INDEX,
     ).reshape(batch_size, seq_len)
 
     return elementwise_loss  # noqa: RET504
@@ -129,14 +133,23 @@ def tv_loss(
 
     Args:
         logits: Draft model logits (softmax applied internally to form q).
-        targets: Target model logits (softmax applied internally to form p).
+        targets: Target model logits (softmax applied internally to form p),
+            or hard token ids. Against a point mass the overlap collapses to
+            the draft's probability of the true token, ``alpha = q_t``, which
+            is the same acceptance rate specialized to a deterministic target.
 
     Returns:
         Per-position TV distance with shape [1, seq_len].
     """
     draft_p = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
-    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
-    overlap = torch.minimum(draft_p, target_p).sum(dim=-1)  # shape: [1, seq_len]
+    if is_hard(targets):
+        safe_ids = targets.clamp_min(0).unsqueeze(-1)
+        overlap = draft_p.gather(-1, safe_ids).squeeze(-1)
+        # Ignored positions contribute no acceptance signal.
+        overlap = torch.where(targets >= 0, overlap, torch.ones_like(overlap))
+    else:
+        target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
+        overlap = torch.minimum(draft_p, target_p).sum(dim=-1)  # shape: [1, seq_len]
     elementwise_loss = 1.0 - overlap
 
     return elementwise_loss  # noqa: RET504

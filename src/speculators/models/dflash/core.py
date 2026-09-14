@@ -11,6 +11,7 @@ from transformers.models.qwen3.modeling_qwen3 import (
 )
 
 from speculators.losses import LossConfig, resolve_loss_config
+from speculators.losses.targets import IGNORE_INDEX
 from speculators.model import DraftVocabMixin, SpeculatorModel
 from speculators.models.attention import create_float_mask
 from speculators.models.dflash import DFlashSpeculatorConfig
@@ -165,6 +166,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         """Target layer IDs for auxiliary hidden states."""
         return self.config.aux_hidden_state_layer_ids
 
+    def prepare_for_pretraining(self) -> None:
+        """Zero the ``fc`` columns pretraining cannot train.
+
+        Pretraining drives only the layer-0 (embedding) slot, so the remaining
+        aux slots would otherwise reach the distillation run at their random
+        init and swamp the pretrained features the moment real verifier hidden
+        states arrive. Zeroed, they receive no input and therefore no gradient
+        during pretraining, so the saved checkpoint starts distillation at an
+        exact identity and grows the aux contributions from nothing. No
+        checkpoint surgery is needed to move between the two.
+        """
+        keep = self._embedding_fc_columns
+        with torch.no_grad():
+            mask = torch.zeros_like(self.fc.weight)
+            mask[:, keep] = 1.0
+            self.fc.weight.mul_(mask)
+
     def load_verifier_weights(self):
         """Reconstruct weights intentionally omitted from DFlash checkpoints."""
         self._load_verifier_weights(
@@ -204,9 +222,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             **cls._build_base_config_kwargs("dflash", verifier_config, **kwargs)
         )
 
+        return cls._finalize_training_model(config, t2d, d2t, **kwargs)
+
+    @classmethod
+    def _finalize_training_model(cls, config, t2d, d2t, **kwargs):
+        """Build, load verifier-owned weights, and apply training-mode setup.
+
+        Shared by every DFlash-family ``from_training_args``.
+        """
         model = cls(config=config)
         model.load_vocab_mappings(t2d, d2t)
         model.load_verifier_weights()
+        if kwargs.get("training_mode") == "pretrain":
+            model.prepare_for_pretraining()
         return model
 
     @staticmethod
@@ -300,6 +328,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             "max_anchors": max_anchors,
             "per_position_loss_weight": per_position_loss_weight,
             "dpace_alpha": dpace_alpha,
+            "training_mode": kwargs.get("training_mode", "distill"),
         }
         return dict(shared), dict(shared)
 
@@ -340,6 +369,68 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             device=device,
         )
 
+    @property
+    def _embedding_fc_columns(self) -> slice:
+        """Columns of ``fc`` that consume verifier layer 0, i.e. the embedding.
+
+        Pretraining has only the embedding to project, so it drives exactly the
+        aux slot that distillation fills with verifier layer 0. This is what
+        lets a pretrained checkpoint load into a distillation run unchanged.
+        """
+        try:
+            slot = list(self.target_layer_ids).index(0)
+        except ValueError:
+            raise ValueError(
+                "Pretraining projects the frozen input embedding through the "
+                "`fc` slot reserved for verifier layer 0, so layer 0 must be "
+                f"among --target-layer-ids (got {list(self.target_layer_ids)})."
+            ) from None
+        return slice(slot * self.hidden_size, (slot + 1) * self.hidden_size)
+
+    @staticmethod
+    def _check_forward_inputs(pretrain, hidden_states, verifier_last_hidden_states):
+        if pretrain or (
+            hidden_states is not None and verifier_last_hidden_states is not None
+        ):
+            return
+        raise ValueError(
+            "Distillation requires `hidden_states` and "
+            "`verifier_last_hidden_states`; pass training_mode='pretrain' to "
+            "train from token ids alone."
+        )
+
+    def _project_features(self, hidden_states, input_ids, *, pretrain: bool):
+        """Project the per-token features the draft layers attend over."""
+        if not pretrain:
+            return self.fc(hidden_states)
+        # Equivalent to projecting [embedding, 0, ..., 0] through the full fc,
+        # without materializing the zeros. The untouched columns get no
+        # gradient, so prepare_for_pretraining's zeros survive to the
+        # checkpoint and the distillation run resumes from an exact identity.
+        return nn.functional.linear(
+            self.embed_tokens(input_ids), self.fc.weight[:, self._embedding_fc_columns]
+        )
+
+    def _hard_targets(self, input_ids, anchored_block_indices, total_seq_len):
+        """Token ids the draft must predict, plus which of them are learnable.
+
+        Aligned to the distillation path: a soft target drawn from verifier
+        position ``p`` is a distribution over the token at ``p + 1``.
+        """
+        label_indices = (
+            (anchored_block_indices + 1) % total_seq_len
+            if self.config.sample_from_anchor
+            else anchored_block_indices
+        )
+        target_ids = input_ids[:, label_indices]
+        if not self.use_draft_vocab:
+            return target_ids, torch.ones_like(target_ids, dtype=torch.bool)
+        # verifier_lm_head is the verifier head sliced by t2d, so draft index
+        # is the running count of kept tokens below this id.
+        in_draft = self.t2d[target_ids]
+        draft_ids = (self.t2d.long().cumsum(0) - 1)[target_ids]
+        return torch.where(in_draft, draft_ids, IGNORE_INDEX), in_draft
+
     @torch.compiler.disable
     def _build_attention_mask(self, loss_mask, max_anchors, document_ids, device):
         total_seq_len = loss_mask.shape[1]
@@ -373,11 +464,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
     def _backbone_forward(
         self,
-        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # [1, total_seq_len]
-        loss_mask: torch.Tensor,  # [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
-        document_ids: torch.Tensor,  # [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, seq, num_hidden*hidden_size]
+        input_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        loss_mask: torch.Tensor | None = None,  # [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor
+        | None = None,  # [1, total_seq_len, hidden_size]
+        document_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         **kwargs,
     ):
@@ -386,9 +478,17 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         Returns ``(hidden, logits, targets, aligned_loss_mask,
         anchored_block_indices)``. DSpark reuses this and adds its Markov and
         confidence heads before computing its own loss.
+
+        Under ``training_mode="pretrain"`` the verifier tensors are absent:
+        features come from the frozen embedding and targets are hard token ids.
+        See :meth:`prepare_for_pretraining`.
         """
-        device = hidden_states.device
-        total_seq_len = hidden_states.shape[1]
+        training_mode = kwargs.pop("training_mode", "distill")
+        pretrain = training_mode == "pretrain"
+        self._check_forward_inputs(pretrain, hidden_states, verifier_last_hidden_states)
+
+        device = input_ids.device
+        total_seq_len = input_ids.shape[1]
         num_anchors = kwargs.pop("max_anchors", 512)
 
         if position_ids is None:
@@ -412,8 +512,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
-        fc_output = self.hidden_norm(fc_output)
+        fc_output = self.hidden_norm(
+            self._project_features(hidden_states, input_ids, pretrain=pretrain)
+        )
         # shape: [1, total_seq_len, hidden_size]
 
         mask_position_ids = get_base_indices_for_anchored_blocks(
@@ -422,16 +523,21 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
         # shape: [1, total_seq_len + num_anchors*block_size]
 
-        # the hidden_states shape doesn't match position_ids but doesn't need
-        # to, as hidden_states is only used to set dtype and device in rotary_emb
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # the fc_output shape doesn't match position_ids but doesn't need
+        # to, as it is only used to set dtype and device in rotary_emb
+        position_embeddings = self.rotary_emb(fc_output, position_ids)
 
         anchored_block_indices = get_base_indices_for_anchored_blocks(
             anchor_positions, self.block_size
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            if anchored_block_indices.numel() < total_seq_len:
+            if pretrain:
+                targets, hard_label_valid = self._hard_targets(
+                    input_ids, anchored_block_indices, total_seq_len
+                )
+                # shape: [1, num_anchors*block_size]
+            elif anchored_block_indices.numel() < total_seq_len:
                 target_indices = (
                     anchored_block_indices
                     if self.config.sample_from_anchor
@@ -480,22 +586,29 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         if not self.config.sample_from_anchor:
             aligned_loss_mask[:, :: self.block_size] = 0
 
+        # Tokens outside a pruned draft vocabulary have no learnable label.
+        if pretrain:
+            aligned_loss_mask = aligned_loss_mask * hard_label_valid.to(
+                aligned_loss_mask.dtype
+            )
+
         return hidden, logits, targets, aligned_loss_mask, anchored_block_indices
 
     @conditional_torch_compile
     def forward(
         self,
-        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
-        input_ids: torch.Tensor,  # shape: [1, total_seq_len]
-        loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
-        document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1,seq,num_hidden*hidden_size]
+        input_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        loss_mask: torch.Tensor | None = None,  # shape: [1, total_seq_len]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, seq, hidden]
+        document_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         loss_config: LossConfig | None = None,
         gamma: float = 4.0,
         max_anchors: int = 512,
         per_position_loss_weight: str = "fixed-exp-decay",
         dpace_alpha: float = 0.5,
+        training_mode: str = "distill",
         **kwargs,
     ):
         _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
@@ -506,6 +619,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             document_ids,
             position_ids,
             max_anchors=max_anchors,
+            training_mode=training_mode,
             **kwargs,
         )
         loss, metrics = compute_metrics(

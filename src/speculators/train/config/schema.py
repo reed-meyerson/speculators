@@ -656,6 +656,15 @@ class TrainConfig(BaseSettings):
         description="Type of speculator model to train "
         "(eagle3, dflash, dflash2, dspark, peagle, mtp).",
     )
+    training_mode: Literal["distill", "pretrain"] = Field(
+        default="distill",
+        description="Objective to train against. 'distill' matches the "
+        "verifier's output distribution and needs verifier hidden states. "
+        "'pretrain' predicts the corpus's own next tokens from the frozen "
+        "input embedding, needing no verifier forward pass, and produces a "
+        "checkpoint that a later 'distill' run can warm-start from directly. "
+        "DFlash-family speculators only.",
+    )
     dry_run: bool = Field(
         default=False,
         description="Build the speculator, initialize weights, save a checkpoint to "
@@ -734,9 +743,30 @@ class TrainConfig(BaseSettings):
                 "dpace" if is_dflash else "fixed-exp-decay"
             )
         if self.loss.loss_fn is None:
-            self.loss.loss_fn = "ce" if is_dflash else "kl_div"
+            hard_targets = self.training_mode == "pretrain"
+            self.loss.loss_fn = "ce" if (is_dflash or hard_targets) else "kl_div"
         if self.dflash.block_size is None:
             self.dflash.block_size = 16 if is_dflash else 8
+        return self
+
+    @model_validator(mode="after")
+    def _validate_training_mode(self) -> "TrainConfig":
+        """Pretraining substitutes the embedding for the verifier's aux hidden
+        states, which only the DFlash family projects through ``fc``, and scores
+        against hard token ids, which only cross-entropy consumes."""
+        if self.training_mode != "pretrain":
+            return self
+        if self.speculator_type not in {"dflash", "dspark", "dflash2"}:
+            raise ValueError(
+                "--training-mode=pretrain supports --speculator-type "
+                f"dflash, dspark, or dflash2 (got {self.speculator_type!r})"
+            )
+        if self.loss.loss_fn != "ce":
+            raise ValueError(
+                "--training-mode=pretrain requires --loss-fn=ce: its targets "
+                f"are hard token ids, not a distribution (got "
+                f"{self.loss.loss_fn!r})"
+            )
         return self
 
     @model_validator(mode="after")
