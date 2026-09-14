@@ -15,12 +15,19 @@ from speculators.config import SpeculatorsConfig, VerifierConfig
 from speculators.model import DraftVocabMixin
 from speculators.models.dflash import DFlashSpeculatorConfig
 from speculators.models.dflash.core import DFlashDraftModel
+from speculators.models.dflash2.config import DFlash2SpeculatorConfig
+from speculators.models.dflash2.core import DFlash2DraftModel
 from speculators.models.dspark.config import DSparkSpeculatorConfig
 from speculators.models.dspark.core import DSparkDraftModel
 from speculators.proposals.greedy import GreedyTokenProposalConfig
 
 if TYPE_CHECKING:
     from pathlib import Path
+
+_CONFIG_FOR_MODEL = {
+    DSparkDraftModel: DSparkSpeculatorConfig,
+    DFlash2DraftModel: DFlash2SpeculatorConfig,
+}
 
 VERIFIER_VOCAB = 64
 VERIFIER_OWNED_OMITTED = {
@@ -56,11 +63,8 @@ def _make_model(model_cls: type, draft_vocab_size: int) -> DFlashDraftModel:
         "sample_from_anchor": True,
         "speculators_config": speculators_config,
     }
-    config = (
-        DSparkSpeculatorConfig(**config_kwargs)
-        if model_cls is DSparkDraftModel
-        else DFlashSpeculatorConfig(**config_kwargs)
-    )
+    config_cls = _CONFIG_FOR_MODEL.get(model_cls, DFlashSpeculatorConfig)
+    config = config_cls(**config_kwargs)
     model = model_cls(config)
     for param in (
         model.embed_tokens.weight,

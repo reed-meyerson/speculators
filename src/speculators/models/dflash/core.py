@@ -27,6 +27,7 @@ from speculators.models.utils import (
     flatten_rope_parameters,
     resolve_target_layer_ids,
     resolve_verifier_norm_class,
+    verifier_layer0_is_input_embedding,
 )
 
 logger = logging.getLogger(__name__)
@@ -177,6 +178,15 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         exact identity and grows the aux contributions from nothing. No
         checkpoint surgery is needed to move between the two.
         """
+        if not verifier_layer0_is_input_embedding(self.config):
+            raise ValueError(
+                "Pretraining substitutes the draft's frozen embedding for the "
+                "verifier's layer-0 hidden state, which requires the verifier "
+                "to feed its first layer the unscaled embedding. This verifier "
+                "is not known to (the Gemma family, for one, scales by "
+                "sqrt(hidden_size), which would silently train the draft on "
+                "mis-scaled features). See UNSCALED_LAYER0_MODEL_TYPES."
+            )
         keep = self._embedding_fc_columns
         with torch.no_grad():
             mask = torch.zeros_like(self.fc.weight)

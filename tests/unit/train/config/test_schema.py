@@ -154,3 +154,33 @@ def test_from_flat_accepts_partial_working_dict():
     assert recovered.draft.num_layers == 6
     # Untouched fields fall back to their schema defaults.
     assert recovered.trainer.epochs == 20
+
+
+def test_pretrain_defaults_loss_to_ce_across_the_dflash_family():
+    """Pretraining scores hard token ids, which only cross-entropy consumes, so
+    the mode drives the loss default even for the variants that distill with
+    KL by default."""
+    for speculator_type in ("dflash", "dspark", "dflash2"):
+        cfg = TrainConfig(speculator_type=speculator_type, training_mode="pretrain")
+        assert cfg.flatten()["loss_fn"] == "ce"
+
+
+def test_pretrain_rejects_speculators_without_an_embedding_projection():
+    with pytest.raises(ValueError, match="training-mode=pretrain"):
+        TrainConfig(speculator_type="eagle3", training_mode="pretrain")
+
+
+def test_pretrain_rejects_a_distributional_loss():
+    with pytest.raises(ValueError, match="requires --loss-fn=ce"):
+        TrainConfig(
+            speculator_type="dflash",
+            training_mode="pretrain",
+            loss={"loss_fn": "kl_div"},
+        )
+
+
+def test_training_mode_defaults_to_distill_and_round_trips():
+    assert TrainConfig().training_mode == "distill"
+    flat = TrainConfig(speculator_type="dflash", training_mode="pretrain").flatten()
+    assert flat["training_mode"] == "pretrain"
+    assert TrainConfig.from_flat(flat).training_mode == "pretrain"

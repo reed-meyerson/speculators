@@ -29,6 +29,27 @@ GEMMA_STYLE_FINAL_NORM_MODEL_TYPES = frozenset(
     )
 )
 
+# Verifier families whose layer-0 auxiliary hidden state is the plain input
+# embedding, so a draft holding a frozen copy of `embed_tokens` can reproduce
+# it without a verifier forward pass. Pretraining depends on that equality.
+#
+# Enumerated, and consulted as an allowlist, for the same reason as the
+# final-norm set above: the Gemma family multiplies its embeddings by
+# `sqrt(hidden_size)` before the first layer, and a family that does so
+# silently trains the draft against mis-scaled features rather than failing.
+# Unknown families are rejected instead of assumed compatible -- extend this
+# set once a family's layer-0 convention has actually been checked.
+UNSCALED_LAYER0_MODEL_TYPES = frozenset(
+    (
+        "llama",
+        "mistral",
+        "qwen2",
+        "qwen2_moe",
+        "qwen3",
+        "qwen3_moe",
+    )
+)
+
 
 @cache
 def _verifier_model_type(name_or_path: str) -> str | None:
@@ -53,6 +74,15 @@ def uses_gemma_style_final_norm(config) -> bool:
         return False
     model_type = _verifier_model_type(name_or_path)
     return model_type is not None and model_type in GEMMA_STYLE_FINAL_NORM_MODEL_TYPES
+
+
+def verifier_layer0_is_input_embedding(config) -> bool:
+    """Whether the verifier's layer-0 hidden state is its unscaled embedding."""
+    verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
+    name_or_path = getattr(verifier, "name_or_path", None)
+    if not name_or_path:
+        return False
+    return _verifier_model_type(name_or_path) in UNSCALED_LAYER0_MODEL_TYPES
 
 
 def resolve_verifier_norm_class(config) -> type:
