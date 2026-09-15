@@ -13,11 +13,11 @@
 # checkpoint is a plain DFlash checkpoint that stage 2 loads with
 # --from-pretrained and resumes from exactly.
 #
-# The one rule that ties the stages together: both must pass the same
-# --target-layer-ids, and layer 0 must be among them. Those ids set the width of
-# `fc`, so a mismatch makes the stage-1 checkpoint unloadable, and without layer
-# 0 there is no slot for pretraining to project the embedding through. Neither
-# is the default, so both are passed explicitly below.
+# Between them sits `speculators expand-aux-layers`, which widens the pretrained
+# `fc` projection to the auxiliary layers distillation will use and leaves the
+# new slots at zero. Pretraining itself commits to nothing: it learns from the
+# embedding alone, so the same run can be widened several ways to feed a
+# layer-selection sweep.
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/dflash_qwen3_8b_pretrain_then_distill.sh
@@ -52,13 +52,14 @@ VLLM_PORT=8000
 BLOCK_SIZE=16
 MAX_ANCHORS=3072
 NUM_LAYERS=5
-TARGET_LAYER_IDS="0 18 33"  # must contain 0; must match vLLM's eagle_aux_hidden_state_layer_ids
+TARGET_LAYER_IDS="0 18 33"  # chosen at the widening step; must match vLLM's eagle_aux_hidden_state_layer_ids
 
 VLLM_GPUS="0,1"
 TRAIN_GPUS="2,3"
 NUM_TRAIN_GPUS=2
 
 PRETRAIN_CKPT="$OUTPUT_DIR/pretrain/checkpoints"
+WIDENED_CKPT="$OUTPUT_DIR/pretrain/widened"
 DISTILL_CKPT="$OUTPUT_DIR/distill/checkpoints"
 # =======================================
 
@@ -81,10 +82,17 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
-    --target-layer-ids $TARGET_LAYER_IDS
+    --target-layer-ids 0
 
-# Step 2: Prepare the distillation data.
-echo "=== Step 2: Preparing distillation data ==="
+# Step 2: Widen the projection to the layers distillation will consume. The
+# pretrained columns move to layer 0's slot; the rest start at zero, so
+# distillation resumes exactly where pretraining stopped.
+echo "=== Step 2: Widening the pretrained projection ==="
+speculators expand-aux-layers "$PRETRAIN_CKPT/checkpoint_best" $TARGET_LAYER_IDS \
+    --output "$WIDENED_CKPT"
+
+# Step 3: Prepare the distillation data.
+echo "=== Step 3: Preparing distillation data ==="
 speculators prepare-data \
     --model "$MODEL" \
     --data "$DATASET" \
@@ -92,8 +100,8 @@ speculators prepare-data \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH"
 
-# Step 3: Launch vLLM for online hidden-state extraction.
-echo "=== Step 3: Launching vLLM server ==="
+# Step 4: Launch vLLM for online hidden-state extraction.
+echo "=== Step 4: Launching vLLM server ==="
 CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     --provenance-dir "$DISTILL_CKPT" \
@@ -113,15 +121,16 @@ until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
 done
 echo "vLLM server ready."
 
-# Step 4: Distill, warm-started from the pretrained checkpoint. Everything here
-# is a normal DFlash run except --from-pretrained.
-echo "=== Step 4: Distilling from the pretrained checkpoint ==="
+# Step 5: Distill, warm-started from the widened checkpoint. Everything here is
+# a normal DFlash run except --from-pretrained, which also supplies the
+# auxiliary layer ids -- --target-layer-ids would be ignored here.
+echo "=== Step 5: Distilling from the widened checkpoint ==="
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
     -m speculators.train \
     --speculator-type dflash \
     --verifier-name-or-path "$MODEL" \
-    --from-pretrained "$PRETRAIN_CKPT/checkpoint_best" \
+    --from-pretrained "$WIDENED_CKPT" \
     --data-path "$OUTPUT_DIR/data" \
     --vllm-endpoint "http://localhost:${VLLM_PORT}/v1" \
     --save-path "$DISTILL_CKPT" \
@@ -131,7 +140,6 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     --block-size "$BLOCK_SIZE" \
     --max-anchors "$MAX_ANCHORS" \
     --num-layers "$NUM_LAYERS" \
-    --target-layer-ids $TARGET_LAYER_IDS \
     --on-missing generate \
     --on-generate delete
 

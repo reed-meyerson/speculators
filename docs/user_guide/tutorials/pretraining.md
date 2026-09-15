@@ -6,50 +6,49 @@ Pretraining removes it. Instead of matching the verifier's distribution, the dra
 
 Pretraining is a *mode*, not an algorithm. It applies to [DFlash](../algorithms/dflash.md), [DFlash2](../algorithms/dflash2.md) and [DSpark](../algorithms/dspark.md), all of which project auxiliary verifier hidden states through the same `fc` layer.
 
-## The two stages
+## The three steps
 
 ```bash
-# Stage 1 -- no vLLM, no data preparation
+# 1. Pretrain. One auxiliary layer -- the embedding is all there is to learn from.
 speculators train \
     --training-mode pretrain \
     --speculator-type dflash \
     --verifier-name-or-path Qwen/Qwen3-8B \
-    --target-layer-ids 0 18 33 \
+    --target-layer-ids 0 \
     --pretrain-dataset HuggingFaceFW/fineweb \
     --pretrain-dataset-config sample-10BT \
     --pretrain-token-budget 1000000000 \
     --total-seq-len 8192 \
     --save-path ./output/pretrain
 
-# Stage 2 -- ordinary distillation, warm-started
+# 2. Widen the projection to the layers distillation will use.
+speculators expand-aux-layers ./output/pretrain/checkpoint_best 0 18 33 \
+    --output ./output/pretrain-wide
+
+# 3. Ordinary distillation, warm-started.
 speculators train \
     --speculator-type dflash \
     --verifier-name-or-path Qwen/Qwen3-8B \
-    --target-layer-ids 0 18 33 \
-    --from-pretrained ./output/pretrain/checkpoint_best \
+    --from-pretrained ./output/pretrain-wide \
     --data-path ./output/data \
     --vllm-endpoint http://localhost:8000/v1 \
     --total-seq-len 8192 \
     --save-path ./output/distill
 ```
 
-`examples/train/dflash_qwen3_8b_pretrain_then_distill.sh` runs both end to end.
+`examples/train/dflash_qwen3_8b_pretrain_then_distill.sh` runs all three end to end.
 
-There is no conversion step between the stages, and there is not meant to be: a pretrained checkpoint *is* a DFlash checkpoint. It declares itself as `dflash`, carries no trace of the training mode, and loads with plain `--from-pretrained`.
+Pretraining learns from the embedding alone, so the checkpoint carries no commitment to which auxiliary layers a finetune will use, or how many. Step 2 is where that choice is made, which means one pretraining run can be widened several different ways and feed a whole layer-selection sweep.
 
-## Layer 0 must be in `--target-layer-ids`
-
-This is the one rule that catches people, and it is not the default.
-
-Pretraining has only the embedding to feed the draft, so it drives exactly the `fc` slot that distillation fills with verifier layer 0 — and layer 0 *is* the embedding. Without layer 0 among the target layers there is no such slot, and the run stops with an error rather than training something meaningless.
-
-Both stages must also pass the **same** ids. The target layers set the width of `fc`, so a stage-2 run with a different selection cannot load the stage-1 checkpoint at all.
+`--from-pretrained` takes the auxiliary layer ids from the checkpoint, so `--target-layer-ids` is ignored in step 3. The selection is whatever you passed to `expand-aux-layers`, and vLLM must be launched extracting those same layers.
 
 ## How the warm start works
 
-Pretraining trains only the `fc` columns fed by layer 0 and holds the rest at exactly zero. Those columns receive no input during pretraining and therefore no gradient, so they reach the checkpoint still zero.
+Pretraining trains the `fc` columns fed by verifier layer 0 -- the embedding. Widening adds columns for the remaining auxiliary layers and leaves them at exactly zero.
 
-That is what makes the handoff exact. When distillation starts, the auxiliary hidden states arrive and their contribution grows from nothing, rather than from a random initialization that would swamp the features pretraining just learned. Stage 2 begins precisely where stage 1 left off.
+That is what makes the handoff exact. When distillation starts, the auxiliary hidden states arrive and their contribution grows from nothing, rather than from a random initialization that would swamp the features pretraining just learned. Distillation begins precisely where pretraining left off.
+
+A checkpoint that has not been widened is still a valid single-auxiliary-layer drafter, so it can be served and evaluated on its own before you commit to a selection.
 
 ## The token budget sets the run length
 

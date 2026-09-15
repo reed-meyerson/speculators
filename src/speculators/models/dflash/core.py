@@ -185,6 +185,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         checkpoint surgery is needed to move between the two.
         """
         keep = self._embedding_fc_columns()
+        # Resolve the scale here too: it reads the verifier config off disk, which
+        # torch.compile cannot trace, so the forward pass must find it cached.
+        self._embedding_scale()
         with torch.no_grad():
             mask = torch.zeros_like(self.fc.weight)
             mask[:, keep] = 1.0

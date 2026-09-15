@@ -11,6 +11,7 @@ from importlib.metadata import version as pkg_version
 import typer
 
 from speculators.cli.convert import convert
+from speculators.cli.expand_aux_layers import expand_aux_layers
 from speculators.cli.generate_offline_data import generate_offline_data
 from speculators.cli.prepare_data import prepare_data
 from speculators.cli.regenerate_responses import regenerate_responses
@@ -45,6 +46,7 @@ def _main(
 
 app.command(rich_help_panel="Pipeline")(prepare_data)
 app.command(name="stitch-mtp", rich_help_panel="Pipeline")(stitch_command)
+app.command(name="expand-aux-layers", rich_help_panel="Pipeline")(expand_aux_layers)
 app.command(rich_help_panel="Pipeline")(generate_offline_data)
 app.command(rich_help_panel="Pipeline")(regenerate_responses)
 app.command(

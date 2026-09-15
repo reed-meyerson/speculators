@@ -615,7 +615,8 @@ RECIPES: dict[str, dict] = {
         "block_size": 16,
         "max_anchors": 3072,
         "num_layers": 5,
-        "target_layer_ids": [0, 18, 33],
+        # Pretraining commits to one aux layer; expand-aux-layers widens later.
+        "target_layer_ids": [0],
         # Pretraining scores hard token ids, so the mode drives the loss.
         "loss_fn": "ce",
     },
