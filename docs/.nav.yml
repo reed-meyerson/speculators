@@ -17,6 +17,7 @@ nav:
           - Tutorials:
                 - user_guide/tutorials/index.md
                 - Train a Speculator: user_guide/tutorials/train.md
+                - Pretraining a Draft Model: user_guide/tutorials/pretraining.md
                 - Multi-Node Training: user_guide/tutorials/multi_node_training.md
                 - Response Regeneration: user_guide/tutorials/response_regeneration.md
                 - Evaluating Model Performance: user_guide/tutorials/evaluating_performance.md

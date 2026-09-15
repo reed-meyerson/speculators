@@ -10,6 +10,10 @@ Speculators supports multi-GPU training via PyTorch Fully Sharded Data Parallel 
 
 Draft models use a reduced vocabulary for faster inference. Speculators automatically builds vocabulary mappings (`t2d` and `d2t` tensors) from token frequency statistics collected during data preparation, selecting the most frequent tokens for the draft vocab. Pre-built mappings can also be provided manually.
 
+## Pretraining Without a Verifier Pass
+
+DFlash-family drafts can be pretrained on raw text before distillation. Instead of matching the verifier's output distribution, the draft predicts the corpus's own next tokens from its frozen copy of the verifier's input embedding -- so no vLLM server, hidden-state extraction, or prepared dataset is needed, and tokens are cheap enough to spend billions of them. The resulting checkpoint is an ordinary DFlash checkpoint that a distillation run warm-starts from with `--from-pretrained`, with no conversion step. See [Pretraining a Draft Model](tutorials/pretraining.md).
+
 ## Multi-Backend Metric Logging
 
 Training metrics can be logged to TensorBoard, Weights & Biases, TrackIO, and MLflow — individually or simultaneously, so that you can use your preferred experiment tracking tool.

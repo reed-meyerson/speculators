@@ -597,6 +597,28 @@ RECIPES: dict[str, dict] = {
         "on_missing": "generate",
         "on_generate": "delete",
     },
+    # Only the first `-m speculators.train` invocation is extracted, which for
+    # this two-stage recipe is the pretraining one -- the stage whose flags are
+    # new and therefore most worth guarding.
+    "dflash_qwen3_8b_pretrain_then_distill.sh": {
+        "verifier_name_or_path": "Qwen/Qwen3-8B",
+        "training_mode": "pretrain",
+        "speculator_type": "dflash",
+        "pretrain_dataset": "HuggingFaceFW/fineweb",
+        "pretrain_dataset_config": "sample-10BT",
+        "pretrain_token_budget": 1000000000,
+        "save_path": (
+            "./output/dflash_qwen3_8b_pretrain_then_distill/pretrain/checkpoints"
+        ),
+        "total_seq_len": 8192,
+        "lr": 3e-4,
+        "block_size": 16,
+        "max_anchors": 3072,
+        "num_layers": 5,
+        "target_layer_ids": [0, 18, 33],
+        # Pretraining scores hard token ids, so the mode drives the loss.
+        "loss_fn": "ce",
+    },
     "eagle3_llama3_8b_ultrachat_offline_5k.sh": {
         "verifier_name_or_path": "meta-llama/Llama-3.1-8B-Instruct",
         "data_path": "./output",

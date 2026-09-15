@@ -48,6 +48,8 @@ torchrun --standalone --nproc_per_node=4 -m speculators.train \
 
 - **`--speculator-type`** (str, default: `"eagle3"`) Type of speculator model to train. Options: `eagle3`, `dflash`, `dflash2`, `dspark`, `peagle`, `mtp`
 
+- **`--training-mode`** (str, default: `"distill"`) Objective to train against. Options: `distill`, `pretrain`. `distill` matches the verifier's output distribution and needs verifier hidden states. `pretrain` predicts the corpus's own next tokens from the frozen input embedding, requiring no verifier forward pass — no vLLM server, hidden-state extraction, or prepared dataset — and produces a checkpoint a later `distill` run warm-starts from via `--from-pretrained`. DFlash-family speculators only, and `--target-layer-ids` must contain layer 0. See [Pretraining a Draft Model](../user_guide/tutorials/pretraining.md).
+
 - **`--from-pretrained`** (str, default: `""`) Path or HF id of an existing draft checkpoint to load weights from and train — either a previously trained draft or the initialized-but-untrained checkpoint produced by `--dry-run`. May also point to a local directory containing only a `config.json`, in which case a fresh draft is initialized from that full speculator config. Takes precedence over all other model-definition options: it is mutually exclusive with `--draft-config` and the decoder-shaping flags (`--num-layers`, `--draft-arch`, `--draft-hidden-act`, `--sliding-window`, `--full-attention-indices`).
 
 - **`--draft-config`** (str, default: `""`) HF id, directory, or JSON path of a decoder config (`LlamaConfig` for eagle3/peagle, `Qwen3Config` for DFlash-family models) used as the draft `transformer_layer_config`; the rest of the speculator is built from the other CLI args. The draft `hidden_size` must match the verifier (mismatch is not yet supported). If a full speculator config is passed, its nested `transformer_layer_config` is extracted. Mutually exclusive with `--from-pretrained` and with the decoder-shaping flags (`--num-layers`, `--draft-arch`, `--draft-hidden-act`, `--sliding-window`, `--full-attention-indices`).
@@ -217,6 +219,26 @@ DSpark builds on DFlash, so all DFlash-specific arguments apply as well.
 - **`--confidence-head-with-markov`** / **`--no-confidence-head-with-markov`** (flag, default: `True`) Feed the Markov previous-token embedding into the confidence head alongside the backbone hidden state.
 
 - **`--confidence-head-alpha`** (float, default: `1.0`) Weight of the confidence-head BCE term.
+
+### Pretraining Arguments
+
+Only used with `--training-mode pretrain`.
+
+- **`--pretrain-dataset`** (str, default: `"HuggingFaceFW/fineweb"`) HuggingFace dataset streamed as the pretraining corpus. When `--pretrain-data-files` is set this names the loader (`json`, `parquet`, `text`) instead.
+
+- **`--pretrain-data-files`** (str list, default: `None`) Local corpus files to stream instead of pulling `--pretrain-dataset` from the Hub.
+
+- **`--pretrain-dataset-config`** (str, default: `None`) Dataset config/subset name, if the corpus has one.
+
+- **`--pretrain-dataset-split`** (str, default: `"train"`) Split to stream from the pretraining corpus.
+
+- **`--pretrain-text-column`** (str, default: `"text"`) Column holding each document's raw text.
+
+- **`--pretrain-token-budget`** (int, default: `1000000000`) Total training tokens across all ranks. Fixes the number of packed sequences, and with it the epoch length and the LR schedule, so `--max-steps` is not needed.
+
+- **`--pretrain-val-documents`** (int, default: `4096`) Documents reserved from the head of the stream for validation. Training skips them, so the splits never overlap.
+
+- **`--pretrain-val-sequences`** (int, default: `64`) Packed sequences used for validation.
 
 ### Sliding Window Attention Arguments
 
