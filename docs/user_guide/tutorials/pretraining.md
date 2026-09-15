@@ -71,11 +71,11 @@ speculators train \
 
 Use `--pretrain-text-column` if the documents are not under `text`.
 
-## Supported verifiers
+## Verifiers that scale their embedding
 
-Pretraining assumes the verifier feeds its first layer the unscaled embedding, which is what makes the draft's frozen copy a faithful stand-in for layer 0. That holds for Llama, Mistral, Qwen, DeepSeek, GLM, Phi, gpt-oss, MiniMax, OLMo, Nemotron and Kimi.
+The draft's frozen embedding stands in for the verifier's layer-0 hidden state, so the two have to match. For most architectures they do: Llama, Mistral, Qwen, DeepSeek, GLM, Phi, gpt-oss, MiniMax, OLMo, Nemotron and Kimi all feed layer 0 the unscaled embedding.
 
-It does not hold for the Gemma family, which multiplies embeddings by `sqrt(hidden_size)`, or for Granite, which applies an `embedding_multiplier`. Those verifiers are rejected rather than silently trained against mis-scaled features. See `SCALED_EMBEDDING_MODEL_TYPES` in `src/speculators/models/utils.py`.
+Two families scale it first — Gemma by `sqrt(hidden_size)` and Granite by `config.embedding_multiplier` — so their layer-0 hidden state is the scaled embedding. Pretraining applies the same factor and works normally; no flag is needed. The factor is resolved from the verifier's config by `verifier_embedding_scale` in `src/speculators/models/utils.py`, and an architecture that is not listed there is assumed to be unscaled.
 
 ## Loss
 

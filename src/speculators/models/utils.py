@@ -30,23 +30,16 @@ GEMMA_STYLE_FINAL_NORM_MODEL_TYPES = frozenset(
 )
 
 # Verifier families that scale the token embedding before the first decoder
-# layer, so their layer-0 auxiliary hidden state is NOT the plain embedding a
-# draft can reproduce from its frozen copy of `embed_tokens`. Pretraining
-# depends on that equality, so it refuses these.
+# layer, and by how much. Their layer-0 auxiliary hidden state is the *scaled*
+# embedding -- vLLM captures it after `embed_input_ids`, which folds the factor
+# in -- so pretraining reproduces layer 0 by applying the same factor to the
+# draft's frozen copy of `embed_tokens`.
 #
-# Unlike the final-norm convention above, the plain case is the overwhelming
-# majority -- Llama, Mistral, Qwen (2/3/3.5/Next), DeepSeek (V2/V3/V4), GLM,
-# Phi, gpt-oss, MiniMax, OLMo, Nemotron and Kimi all feed the unscaled
-# embedding to layer 0 -- so this is a denylist and the default is "plain".
-# Two families break it: Gemma multiplies by `sqrt(hidden_size)` inside a
-# ScaledWordEmbedding subclass (the scale lives in `embed_tokens.forward`,
-# not the model's, so copying the weight alone silently loses it), and
-# Granite applies `config.embedding_multiplier`.
-#
-# Deliberately not exhaustive -- it covers the families we expect as
-# verifiers, and unlisted architectures are assumed plain. Add a family here
-# once its layer-0 convention has been checked.
-SCALED_EMBEDDING_MODEL_TYPES = frozenset(
+# Enumerated, not prefix-matched, for the same reason as the final-norm set
+# above: the convention is not stable within a family. Unlisted architectures
+# are assumed to feed layer 0 the unscaled embedding, which holds for Llama,
+# Mistral, Qwen, DeepSeek, GLM, Phi, gpt-oss, MiniMax, OLMo, Nemotron and Kimi.
+_SQRT_HIDDEN_SIZE_EMBEDDING_MODEL_TYPES = frozenset(
     (
         "diffusion_gemma",
         "diffusion_gemma_text",
@@ -60,6 +53,17 @@ SCALED_EMBEDDING_MODEL_TYPES = frozenset(
         "gemma4_text",
         "gemma4_unified",
         "gemma4_unified_text",
+        "recurrent_gemma",
+        "t5gemma",
+        "t5gemma2",
+        "t5gemma2_text",
+        "vaultgemma",
+    )
+)
+
+# Granite exposes its factor directly on the config instead of deriving it.
+_EMBEDDING_MULTIPLIER_MODEL_TYPES = frozenset(
+    (
         "granite",
         "granite_swa",
         "granitemoe",
@@ -68,11 +72,6 @@ SCALED_EMBEDDING_MODEL_TYPES = frozenset(
         "granitemoeshared",
         "hyperclovax",
         "minicpm3",
-        "recurrent_gemma",
-        "t5gemma",
-        "t5gemma2",
-        "t5gemma2_text",
-        "vaultgemma",
     )
 )
 
@@ -102,18 +101,37 @@ def uses_gemma_style_final_norm(config) -> bool:
     return model_type is not None and model_type in GEMMA_STYLE_FINAL_NORM_MODEL_TYPES
 
 
-def verifier_scales_input_embedding(config) -> bool:
-    """Whether the verifier scales its embedding before the first layer.
+@cache
+def _embedding_scale_for(name_or_path: str) -> float:
+    try:
+        verifier_config = get_verifier_config(name_or_path)
+    except (KeyError, OSError, ValueError):
+        logger.warning(
+            "Could not resolve a config for verifier %s; assuming it feeds "
+            "layer 0 the unscaled embedding.",
+            name_or_path,
+        )
+        return 1.0
+    model_type = str(getattr(verifier_config, "model_type", "") or "").lower()
+    if model_type in _SQRT_HIDDEN_SIZE_EMBEDDING_MODEL_TYPES:
+        return float(verifier_config.hidden_size) ** 0.5
+    if model_type in _EMBEDDING_MULTIPLIER_MODEL_TYPES:
+        return float(getattr(verifier_config, "embedding_multiplier", 1.0))
+    return 1.0
 
-    When it does, layer-0 hidden states are not reproducible from a frozen copy
-    of ``embed_tokens`` alone. Unresolvable verifiers fall through to the plain
-    majority convention, matching :func:`uses_gemma_style_final_norm`.
+
+def verifier_embedding_scale(config) -> float:
+    """Factor the verifier applies to its embedding before the first layer.
+
+    ``1.0`` for the large majority of architectures. Pretraining multiplies the
+    draft's frozen embedding by this to reproduce the verifier's layer-0
+    auxiliary hidden state, which is captured after the scaling.
     """
     verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
     name_or_path = getattr(verifier, "name_or_path", None)
     if not name_or_path:
-        return False
-    return _verifier_model_type(name_or_path) in SCALED_EMBEDDING_MODEL_TYPES
+        return 1.0
+    return _embedding_scale_for(name_or_path)
 
 
 def resolve_verifier_norm_class(config) -> type:

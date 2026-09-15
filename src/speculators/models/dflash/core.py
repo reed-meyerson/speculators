@@ -27,7 +27,7 @@ from speculators.models.utils import (
     flatten_rope_parameters,
     resolve_target_layer_ids,
     resolve_verifier_norm_class,
-    verifier_scales_input_embedding,
+    verifier_embedding_scale,
 )
 
 logger = logging.getLogger(__name__)
@@ -184,14 +184,6 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         exact identity and grows the aux contributions from nothing. No
         checkpoint surgery is needed to move between the two.
         """
-        if verifier_scales_input_embedding(self.config):
-            raise ValueError(
-                "Pretraining substitutes the draft's frozen embedding for the "
-                "verifier's layer-0 hidden state, but this verifier scales its "
-                "embedding before the first layer, so the two differ and the "
-                "draft would train on mis-scaled features. See "
-                "SCALED_EMBEDDING_MODEL_TYPES."
-            )
         keep = self._embedding_fc_columns()
         with torch.no_grad():
             mask = torch.zeros_like(self.fc.weight)
@@ -422,6 +414,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             ) from None
         return slice(slot * self.hidden_size, (slot + 1) * self.hidden_size)
 
+    def _embedding_scale(self) -> float:
+        """Factor reproducing the verifier's layer-0 hidden state, memoized.
+
+        ``1.0`` unless the verifier scales its embedding before the first layer
+        (Gemma, Granite), in which case layer 0 is that scaled embedding and the
+        draft has to match it.
+        """
+        scale = self.__dict__.get("_embedding_scale_cache")
+        if scale is None:
+            scale = verifier_embedding_scale(self.config)
+            self.__dict__["_embedding_scale_cache"] = scale
+        return scale
+
     def _project_features(self, hidden_states, input_ids, *, pretrain: bool):
         """Project the per-token features the draft layers attend over."""
         if not pretrain:
@@ -432,9 +437,9 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         # without materializing the zeros. The untouched columns get no
         # gradient, so prepare_for_pretraining's zeros survive to the
         # checkpoint and the distillation run resumes from an exact identity.
+        embeddings = self.embed_tokens(input_ids) * self._embedding_scale()
         return nn.functional.linear(
-            self.embed_tokens(input_ids),
-            self.fc.weight[:, self._embedding_fc_columns()],
+            embeddings, self.fc.weight[:, self._embedding_fc_columns()]
         )
 
     def _distilled_targets(

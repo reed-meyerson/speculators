@@ -25,10 +25,12 @@ from .test_checkpoint_key_ownership import VERIFIER_VOCAB, _make_model
 FAMILY = [DFlashDraftModel, DSparkDraftModel, DFlash2DraftModel]
 
 
-def _point_at_fake_verifier(model, tmp_path, model_type: str):
+def _point_at_fake_verifier(model, tmp_path, model_type: str, **config):
     verifier_dir = tmp_path / model_type
     verifier_dir.mkdir(parents=True, exist_ok=True)
-    (verifier_dir / "config.json").write_text(json.dumps({"model_type": model_type}))
+    (verifier_dir / "config.json").write_text(
+        json.dumps({"model_type": model_type, **config})
+    )
     model.config.speculators_config.verifier.name_or_path = str(verifier_dir)
     return model
 
@@ -51,29 +53,34 @@ def test_prepare_for_pretraining_zeroes_only_the_non_embedding_slots(
 
 
 @pytest.mark.parametrize(
-    ("model_type", "supported"),
+    ("model_type", "verifier_config", "expected_scale"),
     [
-        ("qwen3", True),
-        ("llama", True),
-        ("deepseek_v3", True),
-        ("gemma3_text", False),
-        ("gemma4", False),
-        ("granite", False),
+        ("qwen3", {}, 1.0),
+        ("llama", {}, 1.0),
+        ("deepseek_v3", {}, 1.0),
+        # sqrt(hidden_size); Gemma keeps hidden_size under text_config.
+        (
+            "gemma4",
+            {"text_config": {"model_type": "gemma4_text", "hidden_size": 16}},
+            4.0,
+        ),
+        ("gemma3_text", {"hidden_size": 16}, 4.0),
+        ("granite", {"embedding_multiplier": 12.0}, 12.0),
     ],
 )
-def test_prepare_for_pretraining_rejects_verifiers_that_scale_embeddings(
-    model_type, supported, tmp_path
+def test_embedding_is_scaled_to_match_the_verifier(
+    model_type, verifier_config, expected_scale, tmp_path
 ):
-    """A verifier that scales its embeddings before layer 0 would silently
-    train the draft against mis-scaled features, so it is refused outright."""
+    """Verifiers that scale their embedding before layer 0 make that scaled
+    value the layer-0 hidden state, so the draft has to reproduce it."""
     model = _point_at_fake_verifier(
-        _make_model(DFlashDraftModel, VERIFIER_VOCAB), tmp_path, model_type
+        _make_model(DFlashDraftModel, VERIFIER_VOCAB),
+        tmp_path,
+        model_type,
+        **verifier_config,
     )
-    if supported:
-        model.prepare_for_pretraining()
-    else:
-        with pytest.raises(ValueError, match="scales its"):
-            model.prepare_for_pretraining()
+    assert model._embedding_scale() == pytest.approx(expected_scale)
+    model.prepare_for_pretraining()
 
 
 def test_pretraining_requires_layer_zero_among_the_target_layers(tmp_path):
