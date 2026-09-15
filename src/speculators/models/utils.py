@@ -29,24 +29,50 @@ GEMMA_STYLE_FINAL_NORM_MODEL_TYPES = frozenset(
     )
 )
 
-# Verifier families whose layer-0 auxiliary hidden state is the plain input
-# embedding, so a draft holding a frozen copy of `embed_tokens` can reproduce
-# it without a verifier forward pass. Pretraining depends on that equality.
+# Verifier families that scale the token embedding before the first decoder
+# layer, so their layer-0 auxiliary hidden state is NOT the plain embedding a
+# draft can reproduce from its frozen copy of `embed_tokens`. Pretraining
+# depends on that equality, so it refuses these.
 #
-# Enumerated, and consulted as an allowlist, for the same reason as the
-# final-norm set above: the Gemma family multiplies its embeddings by
-# `sqrt(hidden_size)` before the first layer, and a family that does so
-# silently trains the draft against mis-scaled features rather than failing.
-# Unknown families are rejected instead of assumed compatible -- extend this
-# set once a family's layer-0 convention has actually been checked.
-UNSCALED_LAYER0_MODEL_TYPES = frozenset(
+# Unlike the final-norm convention above, the plain case is the overwhelming
+# majority -- Llama, Mistral, Qwen (2/3/3.5/Next), DeepSeek (V2/V3/V4), GLM,
+# Phi, gpt-oss, MiniMax, OLMo, Nemotron and Kimi all feed the unscaled
+# embedding to layer 0 -- so this is a denylist and the default is "plain".
+# Two families break it: Gemma multiplies by `sqrt(hidden_size)` inside a
+# ScaledWordEmbedding subclass (the scale lives in `embed_tokens.forward`,
+# not the model's, so copying the weight alone silently loses it), and
+# Granite applies `config.embedding_multiplier`.
+#
+# Deliberately not exhaustive -- it covers the families we expect as
+# verifiers, and unlisted architectures are assumed plain. Add a family here
+# once its layer-0 convention has been checked.
+SCALED_EMBEDDING_MODEL_TYPES = frozenset(
     (
-        "llama",
-        "mistral",
-        "qwen2",
-        "qwen2_moe",
-        "qwen3",
-        "qwen3_moe",
+        "diffusion_gemma",
+        "diffusion_gemma_text",
+        "gemma",
+        "gemma2",
+        "gemma3",
+        "gemma3_text",
+        "gemma3n",
+        "gemma3n_text",
+        "gemma4",
+        "gemma4_text",
+        "gemma4_unified",
+        "gemma4_unified_text",
+        "granite",
+        "granite_swa",
+        "granitemoe",
+        "granitemoe_swa",
+        "granitemoehybrid",
+        "granitemoeshared",
+        "hyperclovax",
+        "minicpm3",
+        "recurrent_gemma",
+        "t5gemma",
+        "t5gemma2",
+        "t5gemma2_text",
+        "vaultgemma",
     )
 )
 
@@ -76,13 +102,18 @@ def uses_gemma_style_final_norm(config) -> bool:
     return model_type is not None and model_type in GEMMA_STYLE_FINAL_NORM_MODEL_TYPES
 
 
-def verifier_layer0_is_input_embedding(config) -> bool:
-    """Whether the verifier's layer-0 hidden state is its unscaled embedding."""
+def verifier_scales_input_embedding(config) -> bool:
+    """Whether the verifier scales its embedding before the first layer.
+
+    When it does, layer-0 hidden states are not reproducible from a frozen copy
+    of ``embed_tokens`` alone. Unresolvable verifiers fall through to the plain
+    majority convention, matching :func:`uses_gemma_style_final_norm`.
+    """
     verifier = getattr(getattr(config, "speculators_config", None), "verifier", None)
     name_or_path = getattr(verifier, "name_or_path", None)
     if not name_or_path:
         return False
-    return _verifier_model_type(name_or_path) in UNSCALED_LAYER0_MODEL_TYPES
+    return _verifier_model_type(name_or_path) in SCALED_EMBEDDING_MODEL_TYPES
 
 
 def resolve_verifier_norm_class(config) -> type:

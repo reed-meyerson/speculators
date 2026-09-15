@@ -52,7 +52,14 @@ def test_prepare_for_pretraining_zeroes_only_the_non_embedding_slots(
 
 @pytest.mark.parametrize(
     ("model_type", "supported"),
-    [("qwen3", True), ("llama", True), ("gemma3_text", False), ("gemma2", False)],
+    [
+        ("qwen3", True),
+        ("llama", True),
+        ("deepseek_v3", True),
+        ("gemma3_text", False),
+        ("gemma4", False),
+        ("granite", False),
+    ],
 )
 def test_prepare_for_pretraining_rejects_verifiers_that_scale_embeddings(
     model_type, supported, tmp_path
@@ -65,7 +72,7 @@ def test_prepare_for_pretraining_rejects_verifiers_that_scale_embeddings(
     if supported:
         model.prepare_for_pretraining()
     else:
-        with pytest.raises(ValueError, match="unscaled embedding"):
+        with pytest.raises(ValueError, match="scales its"):
             model.prepare_for_pretraining()
 
 
