@@ -392,7 +392,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             raise ValueError(
                 "Pretraining projects the frozen input embedding through the "
                 "`fc` slot reserved for verifier layer 0, so layer 0 must be "
-                f"among --target-layer-ids (got {list(self.target_layer_ids)})."
+                f"among --target-layer-ids (got {list(self.target_layer_ids)}). "
+                "Pass it explicitly, e.g. --target-layer-ids 0 "
+                f"{' '.join(str(i) for i in list(self.target_layer_ids)[1:])}, "
+                "and give the distillation run the same ids: they set the width "
+                "of `fc`, so a checkpoint only loads back into a matching layer "
+                "selection."
             ) from None
         return slice(slot * self.hidden_size, (slot + 1) * self.hidden_size)
 

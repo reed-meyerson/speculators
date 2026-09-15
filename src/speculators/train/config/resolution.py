@@ -98,6 +98,7 @@ _ALGORITHM_GROUP_USERS: dict[str, frozenset[str]] = {
     "dspark": frozenset({"dspark"}),
     "peagle": frozenset({"peagle"}),
     "mtp": frozenset({"mtp"}),
+    "pretrain": frozenset({"dflash", "dflash2", "dspark"}),
 }
 
 

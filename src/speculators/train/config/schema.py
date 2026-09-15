@@ -556,6 +556,50 @@ class MTPArgs(_Group):
     )
 
 
+class PretrainArgs(_Group):
+    """Corpus and budget for ``--training-mode pretrain``.
+
+    Pretraining reads raw text rather than generated verifier hidden states,
+    so it needs none of the DataArgs/GenerationArgs plumbing -- no data
+    directory, no hidden-states backend, and no vLLM endpoint.
+    """
+
+    pretrain_dataset: str = Field(
+        default="HuggingFaceFW/fineweb",
+        description="HuggingFace dataset streamed as the pretraining corpus.",
+    )
+    pretrain_dataset_config: str | None = Field(
+        default=None, description="Dataset config/subset name, if the corpus has one."
+    )
+    pretrain_data_files: list[str] | None = Field(
+        default=None,
+        description="Local corpus files (jsonl/parquet/txt) to stream instead of "
+        "pulling --pretrain-dataset from the Hub. When set, --pretrain-dataset "
+        "names the loader ('json', 'parquet', 'text').",
+    )
+    pretrain_dataset_split: str = Field(
+        default="train", description="Split to stream from the pretraining corpus."
+    )
+    pretrain_text_column: str = Field(
+        default="text", description="Column holding each document's raw text."
+    )
+    pretrain_token_budget: int = Field(
+        default=1_000_000_000,
+        description="Total training tokens across all ranks. Fixes the number of "
+        "packed sequences, and with it the epoch length and the LR schedule.",
+    )
+    pretrain_val_documents: int = Field(
+        default=4096,
+        description="Documents reserved from the head of the stream for "
+        "validation. Training skips them, so the splits never overlap.",
+    )
+    pretrain_val_sequences: int = Field(
+        default=64,
+        description="Packed sequences held out for validation. Taken from the head "
+        "of the stream, which training then skips, so the two never overlap.",
+    )
+
+
 # Group attribute name -> group model. Order defines both the flatten() key order
 # (after the root scalars) and a dumped run.yaml's group layout.
 _GROUPS: dict[str, type[_Group]] = {
@@ -573,6 +617,7 @@ _GROUPS: dict[str, type[_Group]] = {
     "dspark": DSparkArgs,
     "peagle": PEagleArgs,
     "mtp": MTPArgs,
+    "pretrain": PretrainArgs,
 }
 
 
@@ -692,6 +737,7 @@ class TrainConfig(BaseSettings):
     dspark: DSparkArgs = Field(default_factory=DSparkArgs)
     peagle: PEagleArgs = Field(default_factory=PEagleArgs)
     mtp: MTPArgs = Field(default_factory=MTPArgs)
+    pretrain: PretrainArgs = Field(default_factory=PretrainArgs)
 
     @model_validator(mode="after")
     def _resolve_derived_defaults(self) -> "TrainConfig":

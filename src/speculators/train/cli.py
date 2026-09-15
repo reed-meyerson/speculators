@@ -30,6 +30,7 @@ from speculators.train.config import TrainConfig
 from speculators.train.dataloader import create_train_val_loaders
 from speculators.train.distributed import (
     get_rank,
+    get_world_size,
     is_distributed,
     maybe_destroy_distributed,
     maybe_setup_distributed,
@@ -560,6 +561,102 @@ def build_draft_model(
     )
 
 
+def _build_distill_loaders(  # noqa: PLR0917
+    args,
+    hidden_states_dtype,
+    hidden_size: int,
+    num_target_layers: int,
+    preprocess,
+):
+    """Loaders over generated verifier hidden states."""
+    backend_registry = HiddenStatesBackend.registry
+    backend_cls = backend_registry[args.hidden_states_backend]
+    # from_train_args is the live runtime consumer of the backend's (mirrored)
+    # train-args, read off the flattened namespace. hs_connectors stays
+    # argparse-based and standalone so vLLM can use it without speculators; that
+    # is why the backend's train-args are mirrored into the pydantic schema rather
+    # than the plugin depending on pydantic. test_backend_reconciliation.py keeps
+    # the mirror complete so nothing read here was dropped during resolution.
+    transfer = backend_cls.from_train_args(args, args.data_path)
+
+    train_loader, val_loader = create_train_val_loaders(
+        data_path=args.data_path,
+        total_seq_len=args.total_seq_len,
+        hidden_states_dtype=hidden_states_dtype,
+        noise_std=args.noise_std,
+        transfer=transfer,
+        vllm_endpoint=args.vllm_endpoint,
+        on_missing=args.on_missing,
+        on_generate=args.on_generate,
+        verifier_name_or_path=args.verifier_name_or_path,
+        request_timeout=args.request_timeout,
+        max_retries=args.max_retries,
+        generation_validation_retries=args.generation_validation_retries,
+        max_consecutive_generation_failures=args.max_consecutive_generation_failures,
+        hidden_size=hidden_size,
+        num_target_layers=num_target_layers,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        preprocess=preprocess,
+        train_data_ratio=args.train_data_ratio,
+    )
+    return train_loader, val_loader
+
+
+def _build_pretrain_loaders(cfg: TrainConfig, args):
+    """Loaders over a streamed raw-text corpus.
+
+    Pretraining reconstructs its own features from the draft's frozen
+    embedding, so there is no hidden-states backend to attach and no vLLM
+    endpoint to reach: the verifier contributes weights, never a forward pass.
+    """
+    from datasets import load_dataset  # noqa: PLC0415
+    from transformers import AutoTokenizer  # noqa: PLC0415
+
+    from speculators.train.pretrain_data import (  # noqa: PLC0415
+        create_pretrain_loaders,
+        sequences_for_token_budget,
+    )
+
+    opts = cfg.pretrain
+    corpus = load_dataset(
+        opts.pretrain_dataset,
+        opts.pretrain_dataset_config,
+        data_files=opts.pretrain_data_files,
+        split=opts.pretrain_dataset_split,
+        streaming=True,
+    )
+    # Validation takes the head of the stream and training skips past it, so
+    # the two never see the same document.
+    val_corpus = corpus.take(opts.pretrain_val_documents)
+    train_corpus = corpus.skip(opts.pretrain_val_documents)
+
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.verifier_name_or_path, trust_remote_code=args.trust_remote_code
+    )
+    train_sequences = sequences_for_token_budget(
+        opts.pretrain_token_budget, args.total_seq_len, get_world_size()
+    )
+    logger.info(
+        "Pretraining on %s for %d tokens (%d packed sequences of %d per rank).",
+        opts.pretrain_dataset,
+        opts.pretrain_token_budget,
+        train_sequences,
+        args.total_seq_len,
+    )
+    return create_pretrain_loaders(
+        corpus=train_corpus,
+        val_corpus=val_corpus,
+        tokenizer=tokenizer,
+        total_seq_len=args.total_seq_len,
+        train_sequences=train_sequences,
+        val_sequences=opts.pretrain_val_sequences,
+        num_workers=args.num_workers,
+        prefetch_factor=args.prefetch_factor,
+        text_column=opts.pretrain_text_column,
+    )
+
+
 def main(cfg: TrainConfig):  # noqa: C901
     # Phase-1 adapter: the model layer still consumes a flat vars(args)-shaped
     # dict via **kwargs, so flatten the typed config back into a namespace here.
@@ -673,37 +770,16 @@ def main(cfg: TrainConfig):  # noqa: C901
     }
     preprocess = preprocess_fns.get(args.speculator_type)
 
-    backend_registry = HiddenStatesBackend.registry
-    backend_cls = backend_registry[args.hidden_states_backend]
-    # from_train_args is the live runtime consumer of the backend's (mirrored)
-    # train-args, read off the flattened namespace. hs_connectors stays
-    # argparse-based and standalone so vLLM can use it without speculators; that
-    # is why the backend's train-args are mirrored into the pydantic schema rather
-    # than the plugin depending on pydantic. test_backend_reconciliation.py keeps
-    # the mirror complete so nothing read here was dropped during resolution.
-    transfer = backend_cls.from_train_args(args, args.data_path)
-
-    train_loader, val_loader = create_train_val_loaders(
-        data_path=args.data_path,
-        total_seq_len=args.total_seq_len,
-        hidden_states_dtype=hidden_states_dtype,
-        noise_std=args.noise_std,
-        transfer=transfer,
-        vllm_endpoint=args.vllm_endpoint,
-        on_missing=args.on_missing,
-        on_generate=args.on_generate,
-        verifier_name_or_path=args.verifier_name_or_path,
-        request_timeout=args.request_timeout,
-        max_retries=args.max_retries,
-        generation_validation_retries=args.generation_validation_retries,
-        max_consecutive_generation_failures=args.max_consecutive_generation_failures,
-        hidden_size=hidden_size,
-        num_target_layers=num_target_layers,
-        num_workers=args.num_workers,
-        prefetch_factor=args.prefetch_factor,
-        preprocess=preprocess,
-        train_data_ratio=args.train_data_ratio,
-    )
+    if cfg.training_mode == "pretrain":
+        train_loader, val_loader = _build_pretrain_loaders(cfg, args)
+    else:
+        train_loader, val_loader = _build_distill_loaders(
+            args,
+            hidden_states_dtype=hidden_states_dtype,
+            hidden_size=hidden_size,
+            num_target_layers=num_target_layers,
+            preprocess=preprocess,
+        )
 
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
