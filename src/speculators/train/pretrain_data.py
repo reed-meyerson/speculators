@@ -64,12 +64,17 @@ class PackedCorpusStream(IterableDataset):
         total_seq_len: int,
         sequences_per_rank: int,
         text_column: str = "text",
+        *,
+        rank: int = 0,
+        world_size: int = 1,
     ):
         self.corpus = corpus
         self.tokenizer = tokenizer
         self.total_seq_len = total_seq_len
         self.sequences_per_rank = sequences_per_rank
         self.text_column = text_column
+        self.rank = rank
+        self.world_size = world_size
         eos = tokenizer.eos_token_id
         if eos is None:
             raise ValueError(
@@ -88,10 +93,18 @@ class PackedCorpusStream(IterableDataset):
         return info.id, info.num_workers
 
     def _documents(self) -> Iterator[list[int]]:
-        """Tokenized documents belonging to this worker."""
+        """Tokenized documents belonging to this rank's share of this worker.
+
+        Ranks and workers form one flat set of shards, so a document is read by
+        exactly one reader anywhere in the job. Sharding per rank is not
+        optional: the token budget is already divided by ``world_size``, so
+        without it every rank would train on the same documents.
+        """
         worker_id, num_workers = self._worker_share()
+        shard = self.rank * num_workers + worker_id
+        num_shards = self.world_size * num_workers
         for index, record in enumerate(self.corpus):
-            if index % num_workers != worker_id:
+            if index % num_shards != shard:
                 continue
             text = record.get(self.text_column)
             if not text:
@@ -173,11 +186,21 @@ def create_pretrain_loaders(  # noqa: PLR0917
     num_workers: int = 1,
     prefetch_factor: int = 2,
     text_column: str = "text",
+    rank: int = 0,
+    world_size: int = 1,
 ) -> tuple[DataLoader, DataLoader]:
     """Training and validation loaders over a streaming text corpus."""
     train = PackedCorpusStream(
-        corpus, tokenizer, total_seq_len, train_sequences, text_column
+        corpus,
+        tokenizer,
+        total_seq_len,
+        train_sequences,
+        text_column,
+        rank=rank,
+        world_size=world_size,
     )
+    # Validation is the same few sequences on every rank, so it is not sharded:
+    # the ranks agree on the number, and the metric is reduced across them.
     val = PackedCorpusStream(
         val_corpus, tokenizer, total_seq_len, val_sequences, text_column
     )

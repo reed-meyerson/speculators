@@ -107,3 +107,35 @@ def test_collated_document_ids_mark_each_document():
     # Ids must be contiguous runs, one per packed document.
     boundaries = int((document_ids[1:] != document_ids[:-1]).sum()) + 1
     assert boundaries == len(torch.unique(document_ids)) == SEQ // 8
+
+
+def _distinct_corpus(num_docs: int, length: int):
+    """Documents with non-overlapping token ids, so a sequence names its source."""
+    return [
+        {"text": " ".join(str(doc * length + i + 2) for i in range(length))}
+        for doc in range(num_docs)
+    ]
+
+
+def _sequences(corpus, sequences, **kwargs):
+    stream = PackedCorpusStream(corpus, _FakeTokenizer(), SEQ, sequences, **kwargs)
+    return [tuple(sample["input_ids"].tolist()) for sample in stream]
+
+
+def test_ranks_read_disjoint_documents():
+    """The token budget is already divided by world_size, so without per-rank
+    sharding every rank would train on the same documents."""
+    corpus = _distinct_corpus(64, SEQ)
+    per_rank = [_sequences(corpus, 4, rank=rank, world_size=4) for rank in range(4)]
+    assert all(len(seqs) == 4 for seqs in per_rank)
+
+    seen = [seq for seqs in per_rank for seq in seqs]
+    assert len(seen) == len(set(seen)), "ranks produced overlapping sequences"
+
+
+def test_a_single_rank_still_reads_every_document():
+    corpus = _distinct_corpus(8, SEQ)
+    solo = _sequences(corpus, 8)
+    sharded = _sequences(corpus, 8, rank=0, world_size=1)
+    assert len(solo) == len(set(solo)) == 8
+    assert solo == sharded

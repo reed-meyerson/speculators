@@ -561,7 +561,7 @@ def build_draft_model(
     )
 
 
-def _build_distill_loaders(  # noqa: PLR0917
+def _build_distill_loaders(
     args,
     hidden_states_dtype,
     hidden_size: int,
@@ -634,8 +634,9 @@ def _build_pretrain_loaders(cfg: TrainConfig, args):
     tokenizer = AutoTokenizer.from_pretrained(
         args.verifier_name_or_path, trust_remote_code=args.trust_remote_code
     )
+    world_size = get_world_size()
     train_sequences = sequences_for_token_budget(
-        opts.pretrain_token_budget, args.total_seq_len, get_world_size()
+        opts.pretrain_token_budget, args.total_seq_len, world_size
     )
     logger.info(
         "Pretraining on %s for %d tokens (%d packed sequences of %d per rank).",
@@ -654,6 +655,8 @@ def _build_pretrain_loaders(cfg: TrainConfig, args):
         num_workers=args.num_workers,
         prefetch_factor=args.prefetch_factor,
         text_column=opts.pretrain_text_column,
+        rank=get_rank(),
+        world_size=world_size,
     )
 
 
