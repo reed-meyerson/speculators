@@ -264,6 +264,16 @@ All speculator types (except `mtp`) use sliding window attention on all draft la
 
 - **`--save-best`** (flag) Save a symbolic link to the checkpoint with the lowest validation loss.
 
+### Warmup-Stable-Merge Arguments
+
+WSM approximates a decay phase by averaging checkpoints from the stable phase. The held checkpoints always span the trailing `--wsm-window-fraction` of *elapsed* training, so a merge is meaningful at any point in the run, not only at the end. Training merges the window into `<save-path>/wsm_merged` when it finishes; `speculators merge-wsm` merges it mid-run.
+
+- **`--num-wsm-checkpoints`** (int, default: `0`) How many checkpoints to hold for averaging. `0` disables WSM. Only these are kept on disk — older ones are deleted as the window advances, so the footprint is this many checkpoints regardless of run length.
+
+- **`--wsm-window-fraction`** (float, default: `0.10`) Fraction of elapsed training the held checkpoints span.
+
+- **`--wsm-start-fraction`** (float, default: `0.01`) Where in the run to start saving, as a fraction of total steps. Saves are densest just after this point and thin out as training proceeds; the total number of saves is logarithmic in run length.
+
 ### Learning Rate Scheduler Arguments
 
 - **`--scheduler-type`** (str, default: `"linear"`) Type of learning rate scheduler. Options: `linear`, `cosine`, `none`

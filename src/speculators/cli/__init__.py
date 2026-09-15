@@ -13,6 +13,7 @@ import typer
 from speculators.cli.convert import convert
 from speculators.cli.expand_aux_layers import expand_aux_layers
 from speculators.cli.generate_offline_data import generate_offline_data
+from speculators.cli.merge_wsm import merge_wsm
 from speculators.cli.prepare_data import prepare_data
 from speculators.cli.regenerate_responses import regenerate_responses
 from speculators.cli.stitch import stitch_command
@@ -49,6 +50,7 @@ app.command(name="stitch-mtp", rich_help_panel="Pipeline")(stitch_command)
 app.command(name="expand-aux-layers", rich_help_panel="Pipeline")(expand_aux_layers)
 app.command(rich_help_panel="Pipeline")(generate_offline_data)
 app.command(rich_help_panel="Pipeline")(regenerate_responses)
+app.command(name="merge-wsm", rich_help_panel="Tools")(merge_wsm)
 app.command(
     name="train",
     rich_help_panel="Pipeline",

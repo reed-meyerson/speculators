@@ -36,6 +36,12 @@ from speculators.train.graceful_shutdown import with_graceful_shutdown
 from speculators.train.optimizers import build_optimizers
 from speculators.train.recovery import BatchRecoveryCoordinator
 from speculators.train.utils import normalize_counted_metrics
+from speculators.train.wsm import (
+    WSMSchedule,
+    WSMStore,
+    merge_checkpoints,
+    wsm_checkpoint_dirs,
+)
 
 root_logger = logging.getLogger("speculators")
 metric_logger = logging.getLogger("speculators.metrics")
@@ -140,6 +146,9 @@ class TrainerConfig(NamedTuple):
     fsdp_shard: bool = False
     gradient_checkpointing: bool = False
     max_steps: int | None = None
+    num_wsm_checkpoints: int = 0
+    wsm_window_fraction: float = 0.10
+    wsm_start_fraction: float = 0.01
 
 
 def _resolve_scheduler_steps(
@@ -185,6 +194,10 @@ def _resolve_scheduler_steps(
 
 
 class Trainer:
+    # Class-level so instances built with ``Trainer.__new__`` -- as several tests
+    # do -- still answer the WSM hooks. ``_setup_wsm`` replaces it per instance.
+    wsm_store: "WSMStore | None" = None
+
     def __init__(
         self,
         model: SpeculatorModel,
@@ -370,6 +383,67 @@ class Trainer:
         # DDP constructor broadcasts rank 0's params to all ranks
         self.model = DistributedDataParallel(self.model)  # type: ignore[assignment]
 
+    def _setup_wsm(self, total_steps: int) -> None:
+        """Prepare the warmup-stable-merge window, if one was asked for.
+
+        Shares the scheduler's horizon: the window is a fraction of the run, so
+        it has to mean the same number of steps the LR schedule is shaped over.
+        """
+        if self.config.num_wsm_checkpoints < 1:
+            self.wsm_store = None
+            return
+        schedule = WSMSchedule(
+            total_steps=total_steps,
+            num_checkpoints=self.config.num_wsm_checkpoints,
+            window_fraction=self.config.wsm_window_fraction,
+            start_fraction=self.config.wsm_start_fraction,
+        )
+        self.wsm_store = WSMStore(
+            root=Path(self.config.save_path) / "wsm",
+            schedule=schedule,
+            is_primary=not self.is_distributed or dist.get_rank() == 0,
+        )
+        root_logger.info(
+            "WSM: holding %d checkpoints over the trailing %.0f%% of training, "
+            "from step %d; roughly %d saves expected.",
+            schedule.num_checkpoints,
+            100 * schedule.window_fraction,
+            schedule.start_step,
+            schedule.estimated_saves(),
+        )
+
+    def maybe_save_wsm_checkpoint(self) -> None:
+        """Extend the WSM window if this step is on the schedule."""
+        if self.wsm_store is None:
+            return
+        self.wsm_store.maybe_save(
+            self.global_step,
+            lambda destination: self.checkpointer.save_model_only(
+                self.model, destination
+            ),
+        )
+
+    def merge_wsm_checkpoints(self) -> Path | None:
+        """Average the held window into a single checkpoint."""
+        if self.wsm_store is None:
+            return None
+        sources = wsm_checkpoint_dirs(self.wsm_store.root)
+        if not sources:
+            root_logger.warning("WSM: nothing to merge.")
+            return None
+        destination = Path(self.config.save_path) / "wsm_merged"
+        if not self.is_distributed or dist.get_rank() == 0:
+            stats = merge_checkpoints(sources, destination)
+            root_logger.info(
+                "WSM: merged %d checkpoints (%s) into %s",
+                stats["merged"],
+                ", ".join(s.name for s in sources),
+                destination,
+            )
+        if self.is_distributed:
+            dist.barrier()
+        return destination
+
     def setup_optimizer(self):
         # Setup optimizer(s). The "muon" option returns two optimizers (Muon for the
         # 2D weight matrices, AdamW for everything else); "adamw" returns a single one.
@@ -381,13 +455,16 @@ class Trainer:
 
         # Setup scheduler(s) — one per optimizer so each optimizer's base LR (e.g.
         # Muon's higher LR vs AdamW's) is warmed up / decayed independently.
-        if self.config.scheduler_type == "none":
-            self.schedulers: list[torch.optim.lr_scheduler.LRScheduler] = []
-            return
-
+        # Resolved before the no-scheduler early return: WSM sizes its window
+        # from the same horizon whether or not an LR schedule is in play.
         scheduler_warmup_steps, scheduler_total_steps = _resolve_scheduler_steps(
             self.config, len(self.train_loader)
         )
+        self._setup_wsm(scheduler_total_steps)
+
+        if self.config.scheduler_type == "none":
+            self.schedulers: list[torch.optim.lr_scheduler.LRScheduler] = []
+            return
 
         def make_scheduler(opt: torch.optim.Optimizer):
             if self.config.scheduler_type == "linear":
@@ -562,6 +639,7 @@ class Trainer:
                     extra={"step": self.global_step},
                 )
             self.global_step += 1
+            self.maybe_save_wsm_checkpoint()
 
             if (
                 self.config.max_steps is not None
@@ -728,3 +806,5 @@ class Trainer:
 
             if self.is_distributed:
                 dist.barrier()
+
+        self.merge_wsm_checkpoints()

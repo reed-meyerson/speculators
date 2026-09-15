@@ -123,6 +123,19 @@ class BaseCheckpointer:
     ):
         raise NotImplementedError
 
+    def save_model_only(
+        self,
+        model: PreTrainedModel,
+        destination: Path,
+        float_dtype: torch.dtype = torch.bfloat16,
+    ):
+        """Write just the weights, for checkpoints that exist to be averaged.
+
+        Optimizer state would double the footprint of a WSM window and is never
+        read back: the merge only touches weights.
+        """
+        raise NotImplementedError
+
     def _get_previous_epoch(self) -> int:
         if not self.path.exists():
             return -1
@@ -359,6 +372,19 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         torch.save(payload, self.optimizer_path(epoch))
         self._copy_train_command(epoch)
 
+    def save_model_only(
+        self,
+        model: PreTrainedModel,
+        destination: Path,
+        float_dtype: torch.dtype = torch.bfloat16,
+    ):
+        raw_model: PreTrainedModel = (
+            model.module if isinstance(model, DistributedDataParallel) else model
+        )  # type: ignore[assignment]
+        state_dict = convert_float_dtype(raw_model.state_dict(), float_dtype)
+        raw_model.save_pretrained(destination, state_dict=state_dict)
+        patch_config_dtype(destination / "config.json", float_dtype)
+
 
 class DistributedCheckpointer(BaseCheckpointer):
     def load_model_state_dict(
@@ -439,4 +465,19 @@ class DistributedCheckpointer(BaseCheckpointer):
             torch.save(optimizer_state_dict, self.optimizer_path(epoch))
             self._copy_train_command(epoch)
 
+        dist.barrier()
+
+    def save_model_only(
+        self,
+        model: PreTrainedModel,
+        destination: Path,
+        float_dtype: torch.dtype = torch.bfloat16,
+    ):
+        state_dict = get_model_state_dict(
+            model, options=StateDictOptions(full_state_dict=True, cpu_offload=True)
+        )
+        state_dict = convert_float_dtype(state_dict, float_dtype)
+        if get_rank() == 0:
+            model.save_pretrained(destination, state_dict=state_dict)
+            patch_config_dtype(destination / "config.json", float_dtype)
         dist.barrier()

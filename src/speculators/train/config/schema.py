@@ -441,6 +441,24 @@ class TrainerArgs(_Group):
             )
         return v
 
+    num_wsm_checkpoints: int = Field(
+        default=0,
+        description="Warmup-stable-merge: how many checkpoints to hold for "
+        "averaging at the end of training. 0 disables it. The held checkpoints "
+        "always span the trailing --wsm-window-fraction of elapsed training, so "
+        "a merge is meaningful at any point in the run, not only at the end.",
+    )
+    wsm_window_fraction: float = Field(
+        default=0.10,
+        description="Fraction of elapsed training the WSM checkpoints span.",
+    )
+    wsm_start_fraction: float = Field(
+        default=0.01,
+        description="Point in the run at which WSM starts saving, as a fraction "
+        "of total steps. Saves are densest just after this point and thin out as "
+        "training proceeds.",
+    )
+
 
 class LoggingArgs(_Group):
     logger: str = Field(
