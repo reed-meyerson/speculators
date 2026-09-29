@@ -245,4 +245,13 @@ def prepare_data(
 
     log.info("Done preparing data")
     log.section(f"Writing dataset to {output}")
-    dataset.save_to_disk(output)
+    # The post-map dataset carries a shuffle indices mapping, and a
+    # single-process save gathers rows through it one at a time (observed
+    # ~3K rows/s on the 97M-row EN corpus -> ~11h). Shard the save across
+    # the same worker count used for the map.
+    save_num_proc = (
+        num_preprocessing_workers
+        if num_preprocessing_workers is not None
+        else default_preprocessing_workers()
+    )
+    dataset.save_to_disk(output, num_proc=save_num_proc)

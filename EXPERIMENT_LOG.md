@@ -195,3 +195,33 @@ Everything else stays untouched — anchor/boundary logic, packer, `ce_token` + 
 **Operational notes for stage 2.** The new id list must include 0 (where the pretrained weights live) — e.g. `[0, 4, 12, 20, 28, 36, 44, 52, 60]` (9 ids, fc in = 46080 at hidden 5120) — and the verifier hs server (`launch_vllm.py --target-layer-ids …`, which appends the final layer 64 itself) and the training config's `draft.target_layer_ids` must use the **same list in the same order** (concat order). The existing chat-corpus hs cache was captured at the old width (8 aux layers) — stage 2 with the converted model needs a **fresh `hidden_states_path`** (or cache wipe) so hs are re-captured at the new width; stale-width hs would fail at the fc matmul.
 
 **Outstanding:** run it on the real pretrain checkpoint when stage 1 is stopped; then stage-2 distillation (warm start via `--from-pretrained` on the converted dir) with a fresh hs server + cache.
+
+## Entry 9: parallelize prepare-data's save_to_disk
+
+**Problem.** `speculators prepare-data`'s final `dataset.save_to_disk(output)`
+ran single-process on a dataset that carries a shuffle indices mapping (the
+preprocessing pipeline shuffles post-map). The save gathers rows through that
+mapping one at a time: observed ~3-12K rows/s (varies with indices locality
+and page cache) on the 97.27M-row FineWeb-Edu EN corpus — a projected 2-11h
+for a ~1.1TB / 2393-shard write, with eight more FineWeb-2 language saves
+behind it. The filesystem itself was exonerated (dd direct-write 8.2 GB/s).
+
+**Change.** `prepare_data.py` now passes `num_proc` to `save_to_disk`, reusing
+the same worker-count resolution as the map (`--num-preprocessing-workers`
+when given, else `default_preprocessing_workers()`). datasets ≥2.14 shards the
+save across workers, each writing whole output shards; the shuffled-order
+gather now runs N-way parallel.
+
+**Verification.** Tiny end-to-end run (single fineweb-edu parquet,
+`--max-samples 200000`, 16 workers): 200K rows -> 16 shards in 13s at
+~50K rows/s (~30x the observed single-process rate; EN projects to ~5 min
+at 120 workers). `load_from_disk` round-trip: 200,000 rows, columns
+`[input_ids, loss_mask, seq_len]`, 207.3M tokens, per-row
+`len(input_ids) == seq_len` spot checks pass.
+
+**Operational note.** The restart replays the map from the datasets
+fingerprint cache (the ~1.1TB map output lives in the HF datasets cache on
+/data), so a killed single-process save costs only the re-save. Restart
+hygiene: `prepare-data` skips an output dir that contains any `*.arrow`, so a
+partial save must be wiped before relaunch (the driver does not pass
+`--overwrite`).
