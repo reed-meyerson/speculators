@@ -93,3 +93,43 @@ Append-only, newest last. Format: `### N. <date> — <title>`, then what changed
 - Metric caveat: `profile/tokens_per_s` is rank-0-local (the profile dict is not all-reduced; only rank 0 logs) — global numbers here are 4× rank-0.
 
 **Outstanding:** 24576/3072 long-run stability (3 GB margin on ranks 6/7); warm-start distillation (stage 2) from this run's checkpoint.
+
+### 3. 2026-09-29 — multilingual raw-text corpus staged (FineWeb-Edu + FineWeb-2)
+
+**What/why.** Stage-1 pretraining wants a raw-text, off-policy corpus (per the fork purpose: pretrain on text, then distill on-policy). Corpus decision: **1/2 English + 1/16 × 8 other languages** by token count — exactly balanced halves. English side: `HuggingFaceFW/fineweb-edu` `sample/100BT`. Other side: 8 subsets of `HuggingFaceFW/fineweb-2` (train splits only; each subset also ships a `test/` split, excluded by construction).
+
+**Language selection** (rationale: top-volume tier — every pick has ≥98 GB total so a 1/16 share is obtainable at any sane budget — plus script/family diversity and Qwen-tokenizer fit):
+
+| Language | Subset | FW-2 total | Chosen (seeded random) |
+|---|---|---|---|
+| Mandarin Chinese | `cmn_Hani` | 1622 GB / 370 shards | 13 shards, 45.5 GB |
+| Japanese | `jpn_Jpan` | 717 GB / 175 shards | 10 shards, 48.4 GB |
+| Korean | `kor_Hang` | 106 GB / 25 shards | 10 shards, 45.3 GB |
+| Russian | `rus_Cyrl` | 1988 GB / 440 shards | 10 shards, 48.4 GB |
+| Standard Arabic | `arb_Arab` | 106 GB / 25 shards | 10 shards, 45.3 GB |
+| Spanish | `spa_Latn` | 638 GB / 146 shards | 10 shards, 47.5 GB |
+| French | `fra_Latn` | 540 GB / 135 shards | 12 shards, 45.1 GB |
+| German | `deu_Latn` | 772 GB / 181 shards | 11 shards, 49.6 GB |
+
+Hindi was considered and excluded: 32 GB total (~5–8B tokens) is insufficient for a 1/16 share against an ~80B-Qwen-token English side. CJK picks double as tokenizer-efficiency coverage (Han/Kana/Hangul); Cyrillic and Arabic cover the remaining scripts.
+
+**Acquisition.** Everything landed on `/data` (56 TB LV, 51 TB free) under `/data/playground/reed-meyerson/` — `/home` (842 GB free) cannot hold parquet + datasets arrow cache + tokenized output together. `/data` root is root-owned; `/data/playground` (1777) is the shared scratch. Downloads via `huggingface_hub` snapshot with `hf_transfer` (Rust chunked downloads) + an authenticated token: ~1 GB/s aggregate, full edu subset in ~5 min. Inventory: `fineweb-edu/` 140 parquet, 286.4 GB (= 267 GiB); `fineweb-2/` 86 parquet, 375.1 GB (= 349 GiB); 616 GiB total.
+
+**Sampling method.** FineWeb-2 shards are CC-MAIN-crawl-ordered (~4.8 GB each, named `NNN_NNNNN.parquet`), so **first-N would be a temporally biased slice** (earliest crawls only). Instead: seeded random shard subset per language (seed 42, sorted-then-shuffled for determinism), targeting 45 GB/language vs the ~10B Qwen-token 1/16 requirement — margin covers per-script token/byte variance. Chosen files recorded in `fineweb-2/manifest.json` (repo-external; the pull script `pull_finetweb2.py` sits next to it on /data). Final mix ratios will be enforced **exactly at prep time** by row-level subsampling after tokenization (per-source token counts are only known then); the shard pull just guarantees sufficient volume.
+
+**Prep-path design (planned; code follows in the next commit).** Minimal fork diff, all in `data_generation/preprocessing.py` (~45 lines, no CLI changes, no vLLM server):
+
+1. `load_raw_dataset`: accept local `.parquet` file / directory of parquets (raw `text` column).
+2. New `_preprocess_raw_text` batch fn: local tokenizer (no chat template, no render endpoint), `add_special_tokens=False` + append `eos_token_id` per doc, `loss_mask = ones`, reuse `_append_row` for `--seq-length` truncation and `--minimum-valid-tokens` filtering.
+3. Dispatch in `_preprocess_batch` on a `text` column **before** the `render_endpoint is required` raise.
+4. Tokenizer plumbed into the map `fn_kwargs` via `get_tokenizer(processor)`.
+
+Everything else stays untouched — anchor/boundary logic, packer, `ce_token` + `target_layer_ids [0]` path — so the raw-text run stays comparable to the chat-corpus run of entry 2. Token-exact mixing, val holdout, and downscaling live in a local driver script outside the fork. `HF_DATASETS_CACHE` must point at /data for the runs (datasets materializes a full arrow copy of the parquet, ~330 GB for the text side).
+
+**Facts discovered:**
+
+- FineWeb-Edu's "100BT" is GPT-2-tokenizer counted; Qwen's larger vocab yields ~20–25% fewer tokens on the same text → English side ≈ 75–80B Qwen tokens, each 1/16 share ≈ 10B.
+- Full mix ≈ 160B Qwen tokens ≈ 20 days at the entry-2 rate of ~90k tok/s; the driver's token budgets make a smaller first pass (e.g. 40B: 20B EN + 2.5B/lang) a one-line change.
+- fineweb-2 hub layout is `data/<lang_Script>/train/*.parquet` + `test/*.parquet` (the tree API needs the split subdirectory; languages are ISO 639-3 + script codes, e.g. `cmn_Hani` not `zho`).
+
+**Outstanding:** write the preprocessing diff + mixing driver; tokenize and stage the mixed arrow dataset; 24576/3072 long-run stability; GPU hold renewal before ~02:40 UTC.
