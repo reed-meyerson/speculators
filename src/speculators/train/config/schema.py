@@ -313,7 +313,9 @@ class LossArgs(_Group):
         default=None,
         description="Loss function specification. A name (kl_div, rkl, jsd, ce, tv, "
         'nla, lk_hybrid) or a JSON dict for a weighted combination, e.g. \'{"ce": 0.1, '
-        '"tv": 0.9}\'. (default: "ce" for dflash, "kl_div" otherwise).',
+        '"tv": 0.9}\'. ce_token is CE against token ids from the input sequence; '
+        "together with --target-layer-ids 0 it trains from raw tokens without "
+        'verifier hidden states. (default: "ce" for dflash, "kl_div" otherwise).',
     )
     ttt_steps: int = Field(
         default=3,

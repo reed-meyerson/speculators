@@ -144,6 +144,7 @@ class DSparkDraftModel(DFlashDraftModel):
                 document_ids,
                 position_ids,
                 max_anchors=max_anchors,
+                hard_targets=self._hard_target_mode(loss_config),
                 **kwargs,
             )
         )

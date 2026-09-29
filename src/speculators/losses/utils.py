@@ -141,6 +141,10 @@ def ce_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
 
 
 def tv_loss(logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+    # Hard token-id targets route to the eager form: the fused kernel exists
+    # to avoid materializing the dense target softmax, which ids never need.
+    if targets.dim() == 2:  # noqa: PLR2004
+        return eager.tv_loss(logits, targets)
     return _fused_kernel("fused_tv_loss")(logits, targets)
 
 
@@ -164,6 +168,12 @@ _FUSED_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": tv_loss,
     "nla": neg_log_acceptance_loss,
     "lk_hybrid": lk_hybrid_loss,
+    # CE against raw token ids rather than a verifier distribution. Routed to
+    # the eager form in both implementations: hard targets have no target
+    # softmax for the fused kernel to avoid. Selecting it together with
+    # --target-layer-ids 0 switches the DFlash/DSpark backbone to features
+    # from the frozen embedding and labels gathered from input_ids.
+    "ce_token": eager.ce_loss,
 }
 
 
@@ -175,6 +185,7 @@ _EAGER_LOSS_FN_MAP: dict[str, Callable[[torch.Tensor, torch.Tensor], torch.Tenso
     "tv": eager.tv_loss,
     "nla": eager.neg_log_acceptance_loss,
     "lk_hybrid": eager.lk_hybrid_loss,
+    "ce_token": eager.ce_loss,
 }
 
 

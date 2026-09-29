@@ -91,19 +91,23 @@ def js_div_loss(
 
 def ce_loss(
     logits: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
-    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size]
+    targets: torch.Tensor,  # shape: [1, seq_len, draft_vocab_size] or [1, seq_len]
 ):
     """Compute per-position cross-entropy loss using argmax of target logits as labels.
 
     Args:
         logits: Draft model logits.
-        targets: Target model logits (argmax taken to produce hard labels).
+        targets: Target model logits (argmax taken to produce hard labels), or
+            token ids that are already hard labels (``ce_token``).
 
     Returns:
         Per-position cross-entropy loss with shape [1, seq_len].
     """
     batch_size, seq_len, draft_vocab_size = logits.shape
-    target_ids = torch.argmax(targets, dim=-1)  # shape: [1, seq_len]
+    # Hard targets ([1, seq_len] ids) pass through; soft targets collapse to argmax.
+    target_ids = (
+        targets if targets.dim() == 2 else torch.argmax(targets, dim=-1)  # noqa: PLR2004
+    )  # shape: [1, seq_len]
 
     elementwise_loss = torch.nn.functional.cross_entropy(
         logits.reshape(-1, draft_vocab_size),
@@ -135,8 +139,14 @@ def tv_loss(
         Per-position TV distance with shape [1, seq_len].
     """
     draft_p = torch.nn.functional.softmax(logits, dim=-1, dtype=torch.float32)
-    target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
-    overlap = torch.minimum(draft_p, target_p).sum(dim=-1)  # shape: [1, seq_len]
+    if targets.dim() == 2:  # noqa: PLR2004
+        # Hard token-id targets: the target is a point mass, so the overlap
+        # sum_v min(q_v, p_v) collapses to the draft's probability of the true
+        # token and TV is simply 1 - q_t.
+        overlap = draft_p.gather(-1, targets.unsqueeze(-1)).squeeze(-1)
+    else:
+        target_p = torch.nn.functional.softmax(targets, dim=-1, dtype=torch.float32)
+        overlap = torch.minimum(draft_p, target_p).sum(dim=-1)  # shape: [1, seq_len]
     elementwise_loss = 1.0 - overlap
 
     return elementwise_loss  # noqa: RET504

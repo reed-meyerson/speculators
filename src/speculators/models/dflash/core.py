@@ -374,6 +374,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
 
         return full_attn_mask, sliding_window_attn_mask, anchor_positions, anchor_valid
 
+    def _hard_target_mode(self, loss_config: LossConfig | None) -> bool:
+        """Whether to train against token ids from the input sequence itself.
+
+        Selected when ``--loss-fn ce_token`` meets an aux selection of layer 0
+        alone: the layer-0 hidden state is the (unscaled, Qwen-family) input
+        embedding, so features are computed from the frozen ``embed_tokens``
+        and labels are gathered from ``input_ids`` — no verifier forward
+        pass or captured hidden states are consumed. Any other config keeps
+        the distillation path unchanged (``ce_token`` then behaves exactly
+        like ``ce``).
+        """
+        return (
+            loss_config is not None
+            and "ce_token" in loss_config
+            and self.target_layer_ids == [0]
+        )
+
     def _backbone_forward(
         self,
         hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
@@ -382,6 +399,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
+        hard_targets: bool = False,
         **kwargs,
     ):
         """Run the anchored-block draft transformer up to the draft logits.
@@ -415,7 +433,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = self.fc(hidden_states)
+        fc_output = (
+            self.fc(self.embed_tokens(input_ids))
+            if hard_targets
+            else self.fc(hidden_states)
+        )
         fc_output = self.hidden_norm(fc_output)
         # shape: [1, total_seq_len, hidden_size]
 
@@ -434,7 +456,19 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         )  # shape: [num_anchors*block_size]
 
         with torch.no_grad():
-            if anchored_block_indices.numel() < total_seq_len:
+            if hard_targets:
+                # Labels gathered from the sequence itself. Aligned with the
+                # distillation path: a soft target drawn from verifier position
+                # p is a distribution over the token at p + 1. (Anchor
+                # selection excludes the last block_size positions, so the +1
+                # never wraps past the sequence end.)
+                label_indices = (
+                    (anchored_block_indices + 1) % total_seq_len
+                    if self.config.sample_from_anchor
+                    else anchored_block_indices
+                )
+                targets = input_ids[:, label_indices]
+            elif anchored_block_indices.numel() < total_seq_len:
                 target_indices = (
                     anchored_block_indices
                     if self.config.sample_from_anchor
@@ -509,6 +543,7 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             document_ids,
             position_ids,
             max_anchors=max_anchors,
+            hard_targets=self._hard_target_mode(loss_config),
             **kwargs,
         )
         loss, metrics = compute_metrics(

@@ -156,9 +156,10 @@ def compute_metrics(
         metrics["accept_len_sum"] = (per_block_len * block_valid).sum()
         metrics["accept_len_total"] = block_valid.sum().clamp_min(1.0)
 
-    # Per-position greedy accuracy
+    # Per-position greedy accuracy. Hard token-id targets pass through;
+    # soft targets collapse to argmax.
     pred_ids = torch.argmax(logits, dim=-1)
-    target_ids = torch.argmax(targets, dim=-1)
+    target_ids = targets if targets.dim() == 2 else torch.argmax(targets, dim=-1)  # noqa: PLR2004
     correct_per_pos, total_per_pos = compute_accuracy_multi_step(
         pred_ids, target_ids, loss_mask, pos_idx, block_size
     )
