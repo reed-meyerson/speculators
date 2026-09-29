@@ -372,8 +372,11 @@ class OptimizerArgs(_Group):
 
 
 class SchedulerArgs(_Group):
-    scheduler_type: Literal["linear", "cosine", "none"] = Field(
-        default="linear", description="LR scheduler type."
+    scheduler_type: Literal["linear", "cosine", "constant", "none"] = Field(
+        default="linear",
+        description="LR scheduler type. 'constant' holds the base LR after "
+        "warmup; 'none' builds no scheduler at all (base LR from step 0, "
+        "warmup ignored).",
     )
     scheduler_warmup_steps: int | None = Field(
         default=None, description="Warmup steps (default: scheduler-dependent)."

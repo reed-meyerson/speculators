@@ -16,6 +16,7 @@ from torch.utils.data import DataLoader
 from tqdm import TqdmExperimentalWarning
 from tqdm.rich import tqdm
 from transformers import (
+    get_constant_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
     get_linear_schedule_with_warmup,
 )
@@ -142,7 +143,7 @@ class TrainerConfig(NamedTuple):
     muon_weight_decay: float = 0.1
     muon_ns_steps: int = 5
     muon_adjust_lr_fn: str = "match_rms_adamw"
-    scheduler_type: Literal["linear", "cosine", "none"] = "linear"
+    scheduler_type: Literal["linear", "cosine", "constant", "none"] = "linear"
     scheduler_warmup_steps: int | None = None
     scheduler_warmup_ratio: float | None = None
     scheduler_total_steps: int | None = None
@@ -409,6 +410,12 @@ class Trainer:
                     opt,
                     num_warmup_steps=scheduler_warmup_steps,
                     num_training_steps=scheduler_total_steps,
+                    last_epoch=last_epoch,
+                )
+            if self.config.scheduler_type == "constant":
+                return get_constant_schedule_with_warmup(
+                    opt,
+                    num_warmup_steps=scheduler_warmup_steps,
                     last_epoch=last_epoch,
                 )
             return get_cosine_schedule_with_warmup(

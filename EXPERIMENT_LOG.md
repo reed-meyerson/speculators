@@ -133,3 +133,15 @@ Everything else stays untouched — anchor/boundary logic, packer, `ce_token` + 
 - fineweb-2 hub layout is `data/<lang_Script>/train/*.parquet` + `test/*.parquet` (the tree API needs the split subdirectory; languages are ISO 639-3 + script codes, e.g. `cmn_Hani` not `zho`).
 
 **Outstanding:** write the preprocessing diff + mixing driver; tokenize and stage the mixed arrow dataset; 24576/3072 long-run stability; GPU hold renewal before ~02:40 UTC.
+
+### 4. 2026-09-29 — `scheduler_type: constant` (flat LR after warmup)
+
+**What/why.** The planned FineWeb raw-text pretraining run (entry 3) wants a **constant learning rate with a short warmup**: schedule-free means the run can be stopped at any token budget without a truncated-decay confound. The trainer's existing `scheduler_type: "none"` builds *no scheduler at all* — base LR from step 0 and `scheduler_warmup_steps` silently ignored — so "constant + warmup" was not expressible. Added a `"constant"` type that wraps transformers' `get_constant_schedule_with_warmup` (one scheduler per optimizer, so the Muon and AdamW groups warm up independently, same as linear/cosine).
+
+**Change.** `Literal["linear", "cosine", "constant", "none"]` in both `train/config/schema.py` (`SchedulerArgs`) and `trainer.py` (`TrainerConfig`), plus the `make_scheduler` branch. No CLI changes needed — the argparse layer is generated from the schema. `scheduler_total_steps` is unused for `constant` (warmup resolution unchanged: explicit steps > ratio > 1% default).
+
+**Planned run values.** `scheduler_type: constant`, `scheduler_warmup_steps: 100` ≈ 10M tokens at ~98K global tokens/step (24576 × 4 ranks, ~99% packing).
+
+**Verification.** LR trajectory on a dummy optimizer: 0 → 0.5×peak at step 50 → peak at step 100 → flat through step 249. `TrainConfig` round-trips `scheduler.scheduler_type: constant` through `flatten()`; `--scheduler-type` choices now include it.
+
+**Outstanding:** none for this piece; part of the raw-text pretraining setup (entries 3, 5, 6).
