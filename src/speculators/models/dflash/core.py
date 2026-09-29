@@ -391,13 +391,23 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             and self.target_layer_ids == [0]
         )
 
+    def token_only_data(self, loss_fn: str | None) -> bool:
+        """Whether this model trains from token ids alone under ``loss_fn``.
+
+        CLI-boundary mirror of :meth:`_hard_target_mode` so the dataloader
+        can skip verifier hidden states whenever they are never consumed.
+        """
+        if loss_fn is None:
+            return False
+        return self._hard_target_mode(resolve_loss_config(loss_fn))
+
     def _backbone_forward(
         self,
-        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
         input_ids: torch.Tensor,  # [1, total_seq_len]
         loss_mask: torch.Tensor,  # [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, T, n_hidden*hidden]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, T, hidden]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         hard_targets: bool = False,
         **kwargs,
@@ -408,8 +418,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         anchored_block_indices)``. DSpark reuses this and adds its Markov and
         confidence heads before computing its own loss.
         """
-        device = hidden_states.device
-        total_seq_len = hidden_states.shape[1]
+        # input_ids is [1, total_seq_len] on the batch device: source device
+        # and length from it so hard-target (token-only) batches need no
+        # hidden states at all.
+        device = input_ids.device
+        total_seq_len = input_ids.shape[1]
         num_anchors = kwargs.pop("max_anchors", 512)
 
         if position_ids is None:
@@ -433,11 +446,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         noise_embedding = self.embed_tokens(mask_token_ids)
         # shape: [1, num_anchors*block_size, hidden_size]
 
-        fc_output = (
-            self.fc(self.embed_tokens(input_ids))
-            if hard_targets
-            else self.fc(hidden_states)
-        )
+        if hard_targets:
+            fc_output = self.fc(self.embed_tokens(input_ids))
+        elif hidden_states is None:
+            raise ValueError(
+                "Distillation features require verifier hidden states."
+                " Token-only batches are only supported with hard targets"
+                " (--loss-fn ce_token --target-layer-ids 0)."
+            )
+        else:
+            fc_output = self.fc(hidden_states)
         fc_output = self.hidden_norm(fc_output)
         # shape: [1, total_seq_len, hidden_size]
 
@@ -447,9 +465,10 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         position_ids = torch.cat([position_ids, mask_position_ids.unsqueeze(0)], dim=1)
         # shape: [1, total_seq_len + num_anchors*block_size]
 
-        # the hidden_states shape doesn't match position_ids but doesn't need
-        # to, as hidden_states is only used to set dtype and device in rotary_emb
-        position_embeddings = self.rotary_emb(hidden_states, position_ids)
+        # rotary_emb only reads dtype and device from its first argument, so
+        # the mask-token embedding stands in when hidden_states is absent
+        # (token-only batches).
+        position_embeddings = self.rotary_emb(noise_embedding, position_ids)
 
         anchored_block_indices = get_base_indices_for_anchored_blocks(
             anchor_positions, self.block_size
@@ -468,6 +487,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                     else anchored_block_indices
                 )
                 targets = input_ids[:, label_indices]
+            elif verifier_last_hidden_states is None:
+                raise ValueError(
+                    "Distillation targets require verifier_last_hidden_states."
+                    " Token-only batches are only supported with hard targets"
+                    " (--loss-fn ce_token --target-layer-ids 0)."
+                )
             elif anchored_block_indices.numel() < total_seq_len:
                 target_indices = (
                     anchored_block_indices
@@ -522,11 +547,11 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     @conditional_torch_compile
     def forward(
         self,
-        hidden_states: torch.Tensor,  # shape: [1,total_seq_len,num_hidden*hidden_size]
         input_ids: torch.Tensor,  # shape: [1, total_seq_len]
         loss_mask: torch.Tensor,  # shape: [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # shape: [1, total_seq_len, hidden_size] # noqa: E501
         document_ids: torch.Tensor,  # shape: [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, T, n_hidden*hidden]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, T, hidden]
         position_ids: torch.Tensor | None = None,  # shape: [1, total_seq_len]
         loss_config: LossConfig | None = None,
         gamma: float = 4.0,
@@ -536,12 +561,12 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
         **kwargs,
     ):
         _, logits, targets, aligned_loss_mask, _ = self._backbone_forward(
-            hidden_states,
-            input_ids,
-            loss_mask,
-            verifier_last_hidden_states,
-            document_ids,
-            position_ids,
+            input_ids=input_ids,
+            loss_mask=loss_mask,
+            document_ids=document_ids,
+            hidden_states=hidden_states,
+            verifier_last_hidden_states=verifier_last_hidden_states,
+            position_ids=position_ids,
             max_anchors=max_anchors,
             hard_targets=self._hard_target_mode(loss_config),
             **kwargs,

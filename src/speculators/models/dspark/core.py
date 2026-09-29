@@ -120,11 +120,11 @@ class DSparkDraftModel(DFlashDraftModel):
     @conditional_torch_compile
     def forward(
         self,
-        hidden_states: torch.Tensor,  # [1, total_seq_len, num_hidden*hidden_size]
         input_ids: torch.Tensor,  # [1, total_seq_len]
         loss_mask: torch.Tensor,  # [1, total_seq_len]
-        verifier_last_hidden_states: torch.Tensor,  # [1, total_seq_len, hidden_size]
         document_ids: torch.Tensor,  # [1, total_seq_len]
+        hidden_states: torch.Tensor | None = None,  # [1, T, n_hidden*hidden]
+        verifier_last_hidden_states: torch.Tensor | None = None,  # [1, T, hidden]
         position_ids: torch.Tensor | None = None,  # [1, total_seq_len]
         loss_config: LossConfig | None = None,
         tv_loss_fn: Callable[[torch.Tensor, torch.Tensor], torch.Tensor] = tv_loss,
@@ -137,12 +137,12 @@ class DSparkDraftModel(DFlashDraftModel):
     ):
         hidden, logits, targets, aligned_loss_mask, anchored_block_indices = (
             self._backbone_forward(
-                hidden_states,
-                input_ids,
-                loss_mask,
-                verifier_last_hidden_states,
-                document_ids,
-                position_ids,
+                input_ids=input_ids,
+                loss_mask=loss_mask,
+                document_ids=document_ids,
+                hidden_states=hidden_states,
+                verifier_last_hidden_states=verifier_last_hidden_states,
+                position_ids=position_ids,
                 max_anchors=max_anchors,
                 hard_targets=self._hard_target_mode(loss_config),
                 **kwargs,

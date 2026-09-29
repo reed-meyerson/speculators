@@ -169,6 +169,7 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
+        require_hidden_states: bool = True,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -202,6 +203,7 @@ class ArrowDataset(BaseDataset):
             retries=generation_validation_retries,
             max_consecutive_failures=max_consecutive_generation_failures,
         )
+        self.require_hidden_states = require_hidden_states
 
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
@@ -287,6 +289,15 @@ class ArrowDataset(BaseDataset):
             raise
 
     def _get_raw_data(self, index: int) -> BatchType | SampleUnavailable:
+        if not self.require_hidden_states:
+            # Token-only training (hard-label mode): verifier hidden states
+            # are never consumed, so neither load nor generate them. Returning
+            # before the transfer is consulted guarantees no vLLM contact.
+            item = self.data[index]
+            return {
+                "input_ids": item["input_ids"],
+                "loss_mask": item["loss_mask"],
+            }
         file_idx = self._map_to_file_idx(index)
         cached_hs = self.transfer.get_cached(file_idx)
         if cached_hs is None:

@@ -239,6 +239,14 @@ class SpeculatorModel(ClassRegistryMixin, PreTrainedModel):  # type: ignore[misc
     main_input_name: ClassVar[str] = "input_ids"  # type: ignore[misc]
     _keys_to_ignore_on_load_missing: ClassVar[list[str]] = []  # type: ignore[assignment,misc]
 
+    def token_only_data(self, loss_fn: str | None) -> bool:  # noqa: ARG002
+        """Whether training with ``loss_fn`` consumes only token ids.
+
+        When True the dataloader may omit verifier hidden states entirely
+        (no capture, no generation, no vLLM contact). Default: False.
+        """
+        return False
+
     @classmethod
     def from_pretrained(
         cls: type["SpeculatorModel"],

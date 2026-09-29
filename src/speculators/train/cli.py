@@ -735,6 +735,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        require_hidden_states=not draft_model.token_only_data(args.loss_fn),
     )
 
     # Get trainer kwargs from model class

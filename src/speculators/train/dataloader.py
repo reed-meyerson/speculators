@@ -112,6 +112,7 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     max_train_batches: int | None = None,
+    require_hidden_states: bool = True,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -120,7 +121,9 @@ def create_train_val_loaders(
     :mod:`speculators.train.distributed`.
     """
     _limit_worker_threads()
-    noise_transform = AddUniformNoise(std=noise_std)
+    # The noise transform indexes hidden-state keys unconditionally; skip it
+    # for token-only datasets whose batches carry none.
+    noise_transform = AddUniformNoise(std=noise_std) if require_hidden_states else None
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
@@ -141,6 +144,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
+        require_hidden_states=require_hidden_states,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -157,6 +161,7 @@ def create_train_val_loaders(
         max_retries=max_retries,
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
+        require_hidden_states=require_hidden_states,
     )
 
     train_loader = _setup_dataloader(
