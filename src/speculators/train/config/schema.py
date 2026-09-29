@@ -389,6 +389,16 @@ class SchedulerArgs(_Group):
     scheduler_total_steps: int | None = Field(
         default=None, description="Total scheduler steps (default: inferred)."
     )
+    scheduler_total_tokens: int | None = Field(
+        default=None,
+        ge=1,
+        description="Total scheduler horizon as a global token budget instead of "
+        "steps: resolved to ceil(tokens / (total_seq_len * world_size)) at "
+        "launch (packing is ~99 percent efficient, so the realized budget is "
+        "within ~1 percent). When set, max_steps defaults to the same horizon "
+        "so the run stops when the schedule completes. Overridden by an "
+        "explicit scheduler_total_steps (with a warning).",
+    )
     scheduler_num_cosine_cycles: float = Field(
         default=0.5, description="Number of cosine cycles for the cosine scheduler."
     )

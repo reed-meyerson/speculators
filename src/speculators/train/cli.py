@@ -3,6 +3,7 @@
 import argparse
 import gc
 import logging
+import math
 import random
 import warnings
 from copy import deepcopy
@@ -741,6 +742,37 @@ def main(cfg: TrainConfig):  # noqa: C901
     # Get trainer kwargs from model class
     train_call_kwargs, val_call_kwargs = model_class.get_trainer_kwargs(**vars(args))
 
+    # Token-denominated scheduler horizon (cool-down runs): resolve to
+    # optimizer steps via global tokens per step, and stop the run at the
+    # same horizon unless max_steps was set explicitly. Read from cfg (not
+    # args) per the phase-1 adapter note above.
+    scheduler_total_steps = cfg.scheduler.scheduler_total_steps
+    max_steps = cfg.trainer.max_steps
+    total_tokens = cfg.scheduler.scheduler_total_tokens
+    if total_tokens is not None:
+        world_size = dist.get_world_size() if dist.is_initialized() else 1
+        tokens_per_step = cfg.data.total_seq_len * world_size
+        token_steps = math.ceil(total_tokens / tokens_per_step)
+        if scheduler_total_steps is not None and scheduler_total_steps != token_steps:
+            logger.warning(
+                "Both scheduler_total_tokens=%s and scheduler_total_steps=%s are "
+                "set; resolving to %s steps from the token budget.",
+                total_tokens,
+                scheduler_total_steps,
+                token_steps,
+            )
+        scheduler_total_steps = token_steps
+        if max_steps is None:
+            max_steps = token_steps
+        elif max_steps != token_steps:
+            logger.warning(
+                "max_steps=%s does not match the scheduler_total_tokens=%s "
+                "horizon of %s steps; the run will stop at max_steps.",
+                max_steps,
+                total_tokens,
+                token_steps,
+            )
+
     trainer_config = TrainerConfig(
         num_epochs=args.epochs,
         save_path=args.save_path,
@@ -758,7 +790,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_type=args.scheduler_type,
         scheduler_warmup_steps=args.scheduler_warmup_steps,
         scheduler_warmup_ratio=args.scheduler_warmup_ratio,
-        scheduler_total_steps=args.scheduler_total_steps,
+        scheduler_total_steps=scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
         checkpoint_freq=args.checkpoint_freq,
         checkpoint_keep=args.checkpoint_keep,
@@ -767,7 +799,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         log_freq=args.log_freq,
         fsdp_shard=args.fsdp_shard,
         gradient_checkpointing=args.gradient_checkpointing,
-        max_steps=args.max_steps,
+        max_steps=max_steps,
     )
     trainer = Trainer(draft_model, trainer_config, train_loader, val_loader)
 
