@@ -145,3 +145,15 @@ Everything else stays untouched — anchor/boundary logic, packer, `ce_token` + 
 **Verification.** LR trajectory on a dummy optimizer: 0 → 0.5×peak at step 50 → peak at step 100 → flat through step 249. `TrainConfig` round-trips `scheduler.scheduler_type: constant` through `flatten()`; `--scheduler-type` choices now include it.
 
 **Outstanding:** none for this piece; part of the raw-text pretraining setup (entries 3, 5, 6).
+
+### 5. 2026-09-29 — keep-N checkpoint rotation for sub-epoch checkpointing
+
+**What/why.** The raw-text run checkpoints hourly via `checkpoint_freq < 1` (see entry 6 planning in entry 3's setup), over a multi-day single epoch. As implemented, sub-epoch saves **overwrite `path/<epoch>/` in place**: only the latest snapshot exists, and a crash mid-write corrupts the only copy. Added rotation: before an overwrite, shift `path/<epoch>/` → `<epoch>.prev1/` → `<epoch>.prev2/` → …, keeping the `checkpoint_keep` most recent snapshots (fresh save + N−1 prevs) and deleting older ones.
+
+**Change.** `BaseCheckpointer.rotate_previous()` + `keep` ctor arg, called at the top of both `save_checkpoint` implementations (rank-0 contexts only). New `--checkpoint-keep` (default 3) plumbed schema → `TrainerConfig` → checkpointer. The dotted `.prevK` names are deliberately not int-parseable: auto-resume (`_get_previous_epoch`) only ever finds the fresh `<epoch>/` dir, so resume semantics are unchanged; prevs are manual-rename recovery points (each carries `training_state.json` with its `global_step`). Whole-epoch checkpointing is unaffected — each epoch writes a fresh dir, so rotation no-ops. End-of-epoch saves after mid-epoch ones rotate the last mid-epoch snapshot to `.prev1` (desirable: the final state lands in `<epoch>/`, the last hourly snapshot is retained as a prev).
+
+**Verification.** Simulated 6 successive mid-epoch saves (rotate-then-write order): final state exactly `0/` (step 6), `0.prev1/` (5), `0.prev2/` (4); auto-resume scan returns only epoch 0; `keep=1` deletes the current dir; rotation on a fresh epoch dir is a no-op; `keep=0` raises. Schema round-trip + CLI flag present.
+
+**Caveat (accepted).** Saves are still not atomic — a kill during a save leaves `<epoch>/` corrupt, but recovery is now `rm -rf <epoch>/ && mv <epoch>.prev1 <epoch>` instead of data loss. Hourly cadence ≈ 3,300 steps at ~98K global tok/s (~324M tokens/h).
+
+**Outstanding:** none for this piece; part of the raw-text pretraining setup (entries 3, 4, 6).

@@ -67,14 +67,48 @@ class BaseCheckpointer:
         ...
     """
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, keep: int = 3):
         self.path = Path(path)
+        self.keep = keep
         self.previous_epoch = self._get_previous_epoch()
 
         if self.previous_epoch != -1:
             self.prev_path: Path | None = self.path / str(self.previous_epoch)
         else:
             self.prev_path = None
+
+    def rotate_previous(self, epoch: int | str, keep: int | None = None) -> None:
+        """Rotate an existing ``<epoch>`` checkpoint aside before an overwrite.
+
+        Sub-epoch checkpointing (``checkpoint_freq < 1``) reuses
+        ``path/<epoch>/``, so every save would clobber the previous snapshot —
+        and a crash mid-write would corrupt the only copy. Before overwriting,
+        shift the existing dirs down (``<epoch>/`` → ``<epoch>.prev1/`` →
+        ``<epoch>.prev2/`` → …), keeping the ``keep`` most recent snapshots
+        (the fresh save plus ``keep - 1`` prevs) and deleting older ones.
+
+        The dotted names are deliberately not int-parseable, so auto-resume
+        (``_get_previous_epoch``) only ever finds the fresh ``<epoch>/`` dir;
+        prevs are manual-rename recovery points (their ``training_state.json``
+        records the step they were taken at). Must be called on rank 0 only.
+        """
+        keep = self.keep if keep is None else keep
+        if keep < 1:
+            raise ValueError(f"checkpoint rotation requires keep >= 1, got {keep}")
+        current = self.path / str(epoch)
+        if not current.exists():
+            return  # fresh dir (e.g. first save of an epoch) — nothing to rotate
+        if keep == 1:
+            shutil.rmtree(current)
+            return
+        oldest = self.path / f"{epoch}.prev{keep - 1}"
+        if oldest.exists():
+            shutil.rmtree(oldest)
+        for i in range(keep - 2, 0, -1):
+            src = self.path / f"{epoch}.prev{i}"
+            if src.exists():
+                src.rename(self.path / f"{epoch}.prev{i + 1}")
+        current.rename(self.path / f"{epoch}.prev1")
 
     @abstractmethod
     def load_model_state_dict(
@@ -343,6 +377,7 @@ class SingleGPUCheckpointer(BaseCheckpointer):
         epoch: int | str,
         float_dtype: torch.dtype = torch.bfloat16,
     ):
+        self.rotate_previous(epoch)
         raw_model: PreTrainedModel = (
             model.module if isinstance(model, DistributedDataParallel) else model
         )  # type: ignore[assignment]
@@ -434,6 +469,7 @@ class DistributedCheckpointer(BaseCheckpointer):
 
         if get_rank() == 0:
             # Only rank 0 saves the checkpoint
+            self.rotate_previous(epoch)
             model.save_pretrained(self.path / str(epoch), state_dict=model_state_dict)
             patch_config_dtype(self.path / str(epoch) / "config.json", float_dtype)
             torch.save(optimizer_state_dict, self.optimizer_path(epoch))

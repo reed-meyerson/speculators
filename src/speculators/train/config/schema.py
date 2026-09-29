@@ -401,6 +401,14 @@ class TrainerArgs(_Group):
         description="Save a checkpoint every N epochs. Values < 1 enable sub-epoch "
         "checkpointing (e.g. 0.5 = every half epoch).",
     )
+    checkpoint_keep: int = Field(
+        default=3,
+        ge=1,
+        description="Snapshots to keep per epoch dir when sub-epoch checkpointing "
+        "overwrites it: the fresh save plus N-1 rotated '<epoch>.prevK' dirs. "
+        "Older rotations are deleted. Ignored for whole-epoch checkpointing "
+        "(each epoch writes a fresh dir).",
+    )
     save_best: bool = Field(
         default=False,
         description="Also point a checkpoint at the lowest validation loss.",

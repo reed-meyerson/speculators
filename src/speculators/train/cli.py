@@ -761,6 +761,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         scheduler_total_steps=args.scheduler_total_steps,
         scheduler_num_cosine_cycles=args.scheduler_num_cosine_cycles,
         checkpoint_freq=args.checkpoint_freq,
+        checkpoint_keep=args.checkpoint_keep,
         save_best=args.save_best,
         hidden_states_dtype=hidden_states_dtype,
         log_freq=args.log_freq,

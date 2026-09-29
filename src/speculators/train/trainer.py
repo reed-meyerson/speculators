@@ -149,6 +149,7 @@ class TrainerConfig(NamedTuple):
     scheduler_total_steps: int | None = None
     scheduler_num_cosine_cycles: float = 0.5
     checkpoint_freq: float = 1
+    checkpoint_keep: int = 3
     save_best: bool = False
     hidden_states_dtype: torch.dtype = torch.bfloat16
     log_freq: int = 1
@@ -222,7 +223,9 @@ class Trainer:
             if self.is_distributed and config.fsdp_shard
             else SingleGPUCheckpointer
         )
-        self.checkpointer: BaseCheckpointer = checkpointer_class(self.config.save_path)
+        self.checkpointer: BaseCheckpointer = checkpointer_class(
+            self.config.save_path, keep=self.config.checkpoint_keep
+        )
 
         self.setup_trainer()
         self.setup_model()
