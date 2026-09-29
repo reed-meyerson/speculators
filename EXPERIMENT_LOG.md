@@ -52,3 +52,44 @@ Append-only, newest last. Format: `### N. <date> — <title>`, then what changed
 - The e2e prep used an uncommitted local tweak to `load_raw_dataset` (accept `.jsonl.gz`/`.json.gz` directly) — dataset-prep convenience, reverted after the run; not part of the branch.
 
 **Outstanding:** equivalence check vs CE-distill; fc-width decision for the corpus-scale run.
+
+### 2. 2026-09-29 — corpus-scale throughput: token-only pretraining (4×H200) vs hidden-states distillation (4+4×H200)
+
+**What ran.** Same host (nm-frk-h200-02, 8× H200 141GB), same corpus (full 1,739,710-row regenerated arrow dataset, ~4.26B tokens, ~73% supervised), same draft recipe (DSpark, 5 layers, `block_size 8`, `sample_from_anchor`, Muon 1e-3, seed 42, FSDP × 4 ranks, 2 epochs, `train_data_ratio 0.99`). Three setups:
+
+1. **Distillation** — upstream `main` @ `e3041dd` (this fork's base). 8 GPUs: 4×H200 vLLM hidden-states server (TP=4, `--max-model-len 8200`, 9 aux layers `[4,12,20,28,36,44,52,60,64]` → fc input `[T, 46080]`) + 4×H200 training. Batch 8192/1024, loss `{"ce":0.1,"tv":0.9}`, `on_missing generate`.
+2. **Token-only** (this branch @ `1c1b145` = entry 1) — `--loss-fn ce_token --target-layer-ids 0`, fc input `[T, 5120]` from the frozen embedding, no server, no hidden states (`on_missing raise` tripwire; transfer never consulted). Batch 12288/1536.
+3. **Token-only, 2× batch probe** — same as (2) at 24576/3072.
+
+**Measured** (rank-0 `profile/*` at steady state; distillation = mean over steps 467–766; 12288 = steps 6–55; 24576 = first ~270 steps):
+
+| | distill 8192/1024 | token-only 12288/1536 | token-only 24576/3072 |
+|---|---|---|---|
+| GPUs | 8 (4 server + 4 train) | 4 | 4 |
+| steps/s | 1.01 | 1.41 | ~0.94 |
+| global tok/s | ~30,100 | ~63,100 | ~90,000 |
+| step_ms | ~990–1080 | 709 | ~1060 |
+| fwd / bwd / opt / fetch ms | 185 / ~215 / ~320 / ~22 | 171 / 272 / 227 / ~4 | ~305 / ~524 / ~228 / ~4.5 |
+| unaccounted step time | ~300 ms | ~0 | ~0 |
+| packing efficiency | 91% | 89% | ~99% |
+| peak train mem (GB / 141) | 87.5 | ~93 | 140.5 |
+| µs per rank-token | ~133 | ~65 | ~44 |
+| projected 2-epoch wall | ~3.3 d | ~1.6 d | ~25 h |
+
+**Findings:**
+
+- **3× the throughput on half the GPUs** (6× per GPU): ~90k vs ~30k global tok/s. Per-rank-token cost drops 133 → 44 µs.
+- **The hs pipeline was the overhead, not the model**: in token-only mode the step components sum exactly to `step_ms` (fwd+bwd+opt+fetch ≈ 1060 at 24576), while distillation carried ~300 ms/step unaccounted (hs collation/staging) plus a fetch path through a live server.
+- **fc input shrinks 9×** (`[T, 46080]` → `[T, 5120]`): step time at 24576 (1060 ms) is barely above distillation's at 8192 (~1000 ms) for 3× the tokens.
+- **Bigger bins pack tighter**: 91% → 89% → ~99% of `total_seq_len` real tokens/step (the multipack sampler's tail waste amortizes).
+- **24576/3072 fits, at the edge**: peak 140.5/143.8 GB on ranks 6/7 (~3 GB margin). The caching allocator logged 3 non-fatal OOM-retry warnings during warmup (24.4 GB transient alloc, recovered after cache flush; no recurrence in ~270 steps). 12288/1536 sits at ~93 GB with wide margin.
+- Loss at 12288: 6.59 → 4.30 by step 55 (matches entry 1's slice trajectory); accept_rate 5e-06 → 0.008 by step 55.
+
+**Reproducibility:**
+
+- Distillation: upstream `vllm-project/speculators` `main` @ `e3041dd`; server `launch_vllm.py Qwen/Qwen3.8-27B --target-layer-ids 4 12 20 28 36 44 52 60 --hidden-states-path <dir> -- --port 8400 --tensor-parallel-size 4 --max-model-len 8200` (vllm 0.30.0); training `torchrun --standalone --nproc_per_node 4 -m speculators.train --config qwen38-dspark-regen-fresh-2ep.yaml`.
+- Token-only: this branch @ `1c1b145` (+ this commit); training `CUDA_VISIBLE_DEVICES=<4 held GPUs> torchrun --standalone --nproc_per_node 4 -m speculators.train --config qwen38-dspark-pretrain-2ep.yaml`, no server. Both configs live untracked in the checkout's `configs/` (fields as listed above); the 24576 probe is the same file with `total_seq_len`/`max_anchors` bumped.
+- Env: torch 2.13.0+cu130, Python 3.12, editable install from the working tree.
+- Metric caveat: `profile/tokens_per_s` is rank-0-local (the profile dict is not all-reduced; only rank 0 logs) — global numbers here are 4× rank-0.
+
+**Outstanding:** 24576/3072 long-run stability (3 GB margin on ranks 6/7); warm-start distillation (stage 2) from this run's checkpoint.
