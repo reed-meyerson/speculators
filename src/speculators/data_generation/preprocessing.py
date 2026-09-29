@@ -485,19 +485,69 @@ def _passthrough_pretokenized(
     return results
 
 
+def _preprocess_raw_text_batch(
+    examples: dict,
+    tokenizer: PreTrainedTokenizerBase,
+    max_length: int,
+    minimum_valid_tokens: int | None = None,
+) -> dict[str, list]:
+    """Convert raw-text documents to speculator training rows.
+
+    Verifier-free pretraining corpus (e.g. FineWeb parquet): the tokenizer
+    bundled with the target model tokenizes locally — no chat template, no
+    render endpoint — an EOS is appended per document as the only
+    document-boundary signal, and every token is supervised.
+    """
+    results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
+    eos_token_id = tokenizer.eos_token_id
+    if eos_token_id is None:
+        raise ValueError(
+            "Raw-text preprocessing requires a tokenizer with an eos_token_id."
+        )
+    encoded = tokenizer(
+        [text if text else "" for text in examples["text"]],
+        add_special_tokens=False,
+    )["input_ids"]
+    num_unsupervised = 0
+    num_maybe_truncated = 0
+    for ids in encoded:
+        ids = ids + [eos_token_id]
+        num_maybe_truncated += len(ids) > max_length
+        status = _append_row(
+            results, ids, [1] * len(ids), max_length, minimum_valid_tokens
+        )
+        num_unsupervised += status == "unsupervised"
+    _warn_seq_length(num_unsupervised, num_maybe_truncated, max_length)
+    return results
+
+
 def _preprocess_batch(
     examples: dict,
     is_multimodal: bool,
     render_endpoint: str | None,
     max_length: int,
     minimum_valid_tokens: int | None = None,
+    tokenizer: PreTrainedTokenizerBase | None = None,
 ) -> dict[str, list]:
-    """Convert on-policy conversations or speculator-format rows for training."""
+    """Convert on-policy conversations, raw text, or speculator-format rows
+    for training."""
 
     # Speculator-format rows already carry their supervision mask; pass them
     # through instead of re-rendering.
     if "input_ids" in examples and "loss_mask" in examples:
         return _passthrough_pretokenized(examples, max_length, minimum_valid_tokens)
+
+    # Raw-text corpus (e.g. FineWeb parquet): off-policy pretraining rows —
+    # every token supervised, no chat template, no render endpoint.
+    if "text" in examples and "conversations" not in examples:
+        if tokenizer is None:
+            raise ValueError(
+                "Raw-text rows require a tokenizer; pass the target model's "
+                "tokenizer to tokenize locally."
+            )
+        return _preprocess_raw_text_batch(
+            examples, tokenizer, max_length, minimum_valid_tokens
+        )
 
     if render_endpoint is None:
         raise ValueError(
@@ -603,6 +653,9 @@ def build_speculator_training_dataset(
     # These rows carry their supervision mask, so _preprocess_batch passes them
     # through without rendering or boundary derivation.
     pretokenized = {"input_ids", "loss_mask"} <= set(original_cols)
+    # Raw-text corpus: tokenized locally with an all-ones loss mask; routes
+    # around the render-endpoint requirement below.
+    raw_text = "text" in original_cols and "conversations" not in original_cols
     # Multimodal rows keep their `messages` so the images survive to hidden-state
     # extraction. Compute once here rather than pickling the heavyweight processor
     # into every map worker just to recheck it.
@@ -610,6 +663,8 @@ def build_speculator_training_dataset(
 
     if pretokenized:
         log.info("Speculator-format rows: using their loss mask, skipping render")
+    elif raw_text:
+        log.info("Raw-text rows: tokenizing locally, all tokens supervised")
     elif render_endpoint is None:
         raise ValueError(
             "render_endpoint is required to convert natural-language "
@@ -622,6 +677,9 @@ def build_speculator_training_dataset(
     # Avoid CPU contention for MM processing:
     # https://github.com/vllm-project/vllm/pull/31879
     with set_default_torch_num_threads() if is_multimodal else nullcontext():
+        # The tokenizer (unlike the full processor) is lightweight enough to
+        # pickle into map workers, and raw-text batches need it locally.
+        tokenizer = get_tokenizer(processor)
         dataset = dataset.map(
             lambda examples: _preprocess_batch(
                 examples,
@@ -629,6 +687,7 @@ def build_speculator_training_dataset(
                 render_endpoint,
                 max_length,
                 minimum_valid_tokens,
+                tokenizer,
             ),
             batched=True,
             num_proc=num_proc,
@@ -733,10 +792,15 @@ def load_raw_dataset(
     Resolution order:
         1. ``hf://datasets/<org>/<repo>/<file>.jsonl`` Hugging Face JSONL URI.
         2. Local ``.json``/``.jsonl`` file.
-        3. Local directory: recursively load all ``*.json``/``*.jsonl`` files
-           as a single dataset.
+        2b. Local ``.parquet`` file (raw-text corpus).
+        3. Local directory: recursively load all ``*.parquet`` files
+           (raw-text corpus), or all ``*.json``/``*.jsonl`` files as a single
+           dataset.
         4. Named preset from ``DATASET_CONFIGS``.
         5. ``hf:<id>[:<subset>:<split>]`` for an arbitrary HuggingFace dataset.
+
+    Raw-text sources (a ``text`` column, no ``conversations``) are tokenized
+    locally without a chat template and produce all-ones loss masks.
 
     Args:
         train_data_path: File path, directory path, preset name, or ``hf:`` spec.
@@ -757,9 +821,16 @@ def load_raw_dataset(
     if train_data_path.endswith((".jsonl", ".json")):
         return load_dataset("json", data_files=train_data_path, split="train"), None
 
+    # 2b. Local parquet file: raw-text corpus
+    if train_data_path.endswith(".parquet"):
+        return load_dataset("parquet", data_files=train_data_path, split="train"), None
+
     # 3. Local directory
     path = Path(train_data_path)
     if path.is_dir():
+        parquet_files = sorted(str(p) for p in path.rglob("*.parquet"))
+        if parquet_files:
+            return load_dataset("parquet", data_files=parquet_files, split="train"), None
         data_files = sorted(
             str(p) for p in (*path.rglob("*.json"), *path.rglob("*.jsonl"))
         )
@@ -785,9 +856,9 @@ def load_raw_dataset(
 
     raise ValueError(
         f"Unsupported dataset: {train_data_path}. Supported: local .json/.jsonl "
-        "file, hf://datasets/<org>/<repo>/<file>.jsonl, local directory of "
-        f".json/.jsonl files, hf:<id>[:<subset>:<split>], or a preset "
-        f"{list(DATASET_CONFIGS.keys())}."
+        "or .parquet file, hf://datasets/<org>/<repo>/<file>.jsonl, local "
+        "directory of .parquet/.json/.jsonl files, "
+        f"hf:<id>[:<subset>:<split>], or a preset {list(DATASET_CONFIGS.keys())}."
     )
 
 
@@ -896,10 +967,16 @@ def load_and_preprocess_dataset(
             )
 
         pretokenized = {"input_ids", "loss_mask"} <= set(raw_dataset.column_names)
+        raw_text = (
+            "text" in raw_dataset.column_names
+            and "conversations" not in raw_dataset.column_names
+        )
         # With a render endpoint the chat template is applied server-side, so a
-        # local processor without a chat_template attribute is fine.
+        # local processor without a chat_template attribute is fine. Raw text
+        # needs neither: it is tokenized locally without a template.
         if (
             not pretokenized
+            and not raw_text
             and not processor_has_chat_template
             and render_endpoint is None
         ):

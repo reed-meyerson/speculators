@@ -3,7 +3,12 @@ Prepare data for speculator training
 
 Accepted inputs contain responses produced by the target model, either as
 natural-language conversations or as speculator-format ``input_ids`` and
-``loss_mask`` rows. For natural-language input this command:
+``loss_mask`` rows. A ``.parquet`` file or directory with a ``text`` column
+is also accepted for verifier-free raw-text pretraining — off-policy by
+design: documents are tokenized locally without a chat template, every
+token is supervised, and an EOS is appended per document.
+
+For natural-language input this command:
 
 1. Uses the target model's vLLM endpoint to render each conversation
 2. Derives a loss mask from each assistant-turn boundary
