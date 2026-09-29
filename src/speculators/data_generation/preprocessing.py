@@ -693,7 +693,10 @@ def build_speculator_training_dataset(
             num_proc=num_proc,
             batch_size=1000,
             remove_columns=original_cols,
-            keep_in_memory=True,  # skip caching
+            # Corpus-scale inputs (100M+ rows, ~1.3TB of arrow) do not fit in
+            # RAM as an in-memory table; cache the map output to
+            # HF_DATASETS_CACHE instead.
+            keep_in_memory=False,
         )
 
     dataset.set_format(type="torch")
