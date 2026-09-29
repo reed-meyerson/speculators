@@ -20,6 +20,8 @@ The experiment itself: a two-stage recipe — pretrain the DSpark draft on raw t
 
 `Qwen/Qwen3.8-27B` — `model_type=qwen3_5` (text backbone `qwen3_5_text`), 64 decoder layers, hidden_size 5120, vocab 248320. Qwen-family convention: layer 0 consumes the **unscaled** embedding, so pretraining can substitute `embed_tokens(input_ids)` for the layer-0 aux hidden state directly.
 
+**No draft-vocab pruning.** The draft trains on the full 248320-token verifier vocab. Every piece of machinery that exists only for pruned vocabularies — the `t2d`/`d2t` mappings, hard-label remapping, the `IGNORE_INDEX`/`unlearnable` masking of corpus tokens outside the draft vocab — can be assumed away.
+
 ## Entries
 
 Append-only, newest last. Format: `### N. <date> — <title>`, then what changed, what ran, what it showed. Divergences from `dflash-pretraining` are called out where they happen.
