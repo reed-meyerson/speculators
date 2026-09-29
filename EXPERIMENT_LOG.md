@@ -157,3 +157,17 @@ Everything else stays untouched — anchor/boundary logic, packer, `ce_token` + 
 **Caveat (accepted).** Saves are still not atomic — a kill during a save leaves `<epoch>/` corrupt, but recovery is now `rm -rf <epoch>/ && mv <epoch>.prev1 <epoch>` instead of data loss. Hourly cadence ≈ 3,300 steps at ~98K global tok/s (~324M tokens/h).
 
 **Outstanding:** none for this piece; part of the raw-text pretraining setup (entries 3, 4, 6).
+
+### 6. 2026-09-29 — mid-epoch validation at checkpoint boundaries
+
+**What/why.** `run_training` validates only at **epoch end** — for the raw-text run (single ~160B-token epoch, stopped prematurely after days), that means validation would never fire, and the stop decision would have to ride on train-loss alone. Added: at each mid-epoch checkpoint boundary (the existing `checkpoint_freq < 1` save site in `train_epoch`), run `val_epoch` after the checkpoint is written, save `val_metrics.json` into the (rotating, entry 5) epoch dir, and track best val loss in the log. Metrics are also logged to the metric backend keyed by `global_step` (same path as epoch-end val), so trackio gets an hourly val curve.
+
+**Change.** ~20 lines in `trainer.py` `train_epoch`: save → `val_epoch` → `save_val_metrics` (rank-0, barrier) → best-loss log line → **`self.model.train()`** — the critical fix, since `val_epoch` sets eval mode and the mid-epoch loop would otherwise continue in eval mode (`train_epoch`'s own `model.train()` only fires on epoch entry). No-ops when `val_loader is None` or `save_best=True` (mid-epoch checkpointing is disabled under `save_best`). Ordering: checkpoint **before** val, so a death during the ~3-min val pass still leaves the checkpoint on disk.
+
+**Verification.** Stubbed-loop test of the boundary block: fires only at `local_step % step_interval == 0` (and only when the `MIN_STEP_PCT` tail guard passes), save→val→metrics→`train()` ordering, `best_val_loss` tracking, `val_metrics.json` content. Full module + CLI import clean.
+
+**Run parameters this enables.** Hourly val at ~324M-token boundaries; val slice sized ~50M tokens (~0.03% of the mix, ~3 min/pass) — the stop decision gets a val-loss signal roughly every 20 train-side loss-logged... every hour, aligned with each kept checkpoint.
+
+**Caveats (accepted).** `best_checkpoint` symlink is not created in this path (rotation would make a standing symlink lie about "best"); on resume `best_val_loss` restarts at ∞ (informational only). Val cost is serial with training (~5% overhead at 3 min/hour).
+
+**Outstanding:** none for this piece; part of the raw-text pretraining setup (entries 3–5).

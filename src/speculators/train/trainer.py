@@ -602,6 +602,25 @@ class Trainer:
                 # Avoid saving back to back ay the end of each epoch
             ):
                 self.maybe_save_checkpoint(epoch, local_step=local_step)
+                # Sub-epoch checkpointing over a multi-day single epoch means
+                # epoch-end validation would never fire — the run is stopped
+                # long before the epoch completes. Validate at each mid-epoch
+                # checkpoint boundary instead. Metrics are logged keyed by
+                # global_step and ride along in the (rotating) epoch dir.
+                val_metrics = self.val_epoch(epoch)
+                if val_metrics is not None:
+                    self.checkpointer.save_val_metrics(epoch, val_metrics)
+                    if (
+                        "loss_epoch" in val_metrics
+                        and val_metrics["loss_epoch"] < self.best_val_loss
+                    ):
+                        self.best_val_loss = val_metrics["loss_epoch"]
+                        root_logger.info(
+                            "New best val loss "
+                            f"{self.best_val_loss:.6f} at global step "
+                            f"{self.global_step}"
+                        )
+                self.model.train()  # val_epoch leaves the model in eval mode
 
     def _maybe_val_sync(self, batch_index: int) -> None:
         if not self.is_distributed or _VAL_SYNC_INTERVAL <= 0:
