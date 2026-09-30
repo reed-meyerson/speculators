@@ -8,10 +8,13 @@ if TYPE_CHECKING:
 
 import os
 
+from functools import partial
+
 import torch
 from torch.utils.data import DataLoader
 
 from hs_connectors import HiddenStatesTransfer
+from hs_connectors.transfer import MooncakeTransfer
 from speculators.train.data import (
     ArrowDataset,
     BaseDataset,
@@ -45,11 +48,20 @@ def _limit_worker_threads() -> None:
     os.environ.setdefault("MKL_NUM_THREADS", "1")
 
 
-def _worker_init_fn(worker_id: int) -> None:  # noqa: ARG001
+def _worker_init_fn(worker_id: int, bind_device: bool = True) -> None:  # noqa: ARG001
     torch.set_num_threads(1)
 
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if torch.accelerator.is_available():
+    # Device binding exists for hidden-states backends whose workers touch
+    # CUDA (mooncake's transfer engine allocates its local segment on the
+    # rank's device — upstream #1168). For file-backed/token-only paths the
+    # workers are pure CPU: pinning happens in the main process and H2D in
+    # the trainer. Creating a CUDA context per worker there costs ~616MB of
+    # GPU memory each (12 train + 12 val workers per rank) and context
+    # creation has been observed to fail with cudaErrorMemoryAllocation
+    # when a fresh val-worker pool spawns while training holds the device —
+    # so it is opt-in via ``bind_device``.
+    if bind_device and torch.accelerator.is_available():
+        local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         torch.accelerator.set_device_index(local_rank)
 
 
@@ -62,6 +74,7 @@ def _setup_dataloader(
     prefetch_factor: int | None = 4,
     preprocess: Callable[[BatchType], BatchType] | None = None,
     max_batches: int | None = None,
+    worker_bind_device: bool = False,
 ) -> DataLoader:
     batch_sampler = MultipackDistributedBatchSamplerV2(
         batch_max_length=total_seq_len,
@@ -86,7 +99,11 @@ def _setup_dataloader(
         ),
         persistent_workers=use_workers,
         multiprocessing_context="spawn" if use_workers else None,
-        worker_init_fn=_worker_init_fn if use_workers else None,
+        worker_init_fn=(
+            partial(_worker_init_fn, bind_device=worker_bind_device)
+            if use_workers
+            else None
+        ),
     )
 
 
@@ -124,6 +141,10 @@ def create_train_val_loaders(
     # The noise transform indexes hidden-state keys unconditionally; skip it
     # for token-only datasets whose batches carry none.
     noise_transform = AddUniformNoise(std=noise_std) if require_hidden_states else None
+    # Workers only touch CUDA for hidden-states backends that move tensors
+    # on-device in-process (mooncake). File-backed/token-only workers are
+    # pure CPU (see _worker_init_fn).
+    worker_bind_device = isinstance(transfer, MooncakeTransfer)
 
     if not (0.0 < train_data_ratio < 1.0):
         raise ValueError(f"train_data_ratio must be in (0, 1), got {train_data_ratio}")
@@ -173,6 +194,7 @@ def create_train_val_loaders(
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
         max_batches=max_train_batches,
+        worker_bind_device=worker_bind_device,
     )
     val_loader = _setup_dataloader(
         val_dataset,
@@ -182,6 +204,7 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        worker_bind_device=worker_bind_device,
     )
 
     return train_loader, val_loader

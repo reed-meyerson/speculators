@@ -362,3 +362,50 @@ parallel, cached per epoch) — now the dominant one-time startup cost after
 the fix.
 
 **Outstanding:** relaunch the smoke test on the corrected path.
+
+## Entry 12: no CUDA contexts in dataloader workers for file/token-only paths
+
+**Problem.** Smoke run 2 (val fix from entry 11 in, everything else identical)
+trained 20 steps fine, saved the step-20 checkpoint, then died the moment the
+boundary validation started: rank1 and rank2 both crashed with
+`torch.AcceleratorError: CUDA error: out of memory` raised from
+`torch.accelerator.set_device_index(local_rank)` inside `_worker_init_fn`
+(DataLoader worker process 6, val loader spawn). With 141GB H200s at ~23GB
+training usage this is not device-memory exhaustion; it is a driver-level
+allocation failure at context creation while a fresh 12-worker val pool
+spawns concurrently with the persistent train-worker pool, the main process
+pinning the first val batches, and workers fetching. (A bare torch CUDA
+context on this box measures 616 MiB — 24 workers/rank ≈ 15GB — so capacity
+was never the issue; kernel log clean, /dev/shm and fds fine, no cgroup
+limits from canhazgpu.) Smoke run 1 never hit it only because its val pass
+was empty (entry 11's regression): zero val batches meant workers spawned
+but never fetched/pinned.
+
+**Root cause.** `_worker_init_fn` binds each worker's CUDA device
+unconditionally — added upstream in #1168 ("Spawn mooncake clients on
+dataloader's associated rank") for hidden-states backends whose workers
+touch CUDA in-process (mooncake's transfer engine allocates its local
+segment on the rank's device). For file-backed/token-only paths the workers
+are pure CPU: arrow reads → CPU tensors → collate on CPU; pinning happens in
+the main process and H2D in the trainer. The device binding there is pure
+waste — 24 dead 616 MiB contexts per GPU — and, as observed, a crash vector
+during concurrent pool spawn.
+
+**Change.** `create_train_val_loaders` computes
+`worker_bind_device = isinstance(transfer, MooncakeTransfer)` and passes it
+through `_setup_dataloader` to a `partial(_worker_init_fn, bind_device=...)`
+worker init (picklable under the spawn context). Mooncake runs keep upstream
+behavior exactly; file/token-only workers never touch CUDA at all
+(`torch.accelerator.is_available()` is short-circuited behind `bind_device`,
+so workers do not even query the driver).
+
+**Verification.** `_worker_init_fn` semantics: default `bind_device=True`
+reproduces the upstream behavior (device set to LOCAL_RANK, matching
+upstream's unit tests); `bind_device=False` never calls the accelerator API.
+The bound partial round-trips through pickle (spawn requirement). Modules
+import clean. Upstream `test_dataloader.py` expectations (bind by default)
+are unchanged.
+
+**Outstanding:** smoke run 3 with both fixes (entry 11's lengths + this) —
+expect the step-20 boundary: checkpoint save → val pass over 523 batches →
+resume training to step 40 → save/val → finish at 50.
