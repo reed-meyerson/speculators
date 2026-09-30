@@ -5,6 +5,7 @@ from os import PathLike
 from pathlib import Path
 from typing import Any, Literal, cast
 
+import numpy as np
 import openai
 import torch
 from datasets import load_from_disk
@@ -232,9 +233,25 @@ class ArrowDataset(BaseDataset):
     def __len__(self):
         return len(self.data)
 
-    def _compute_approx_lengths(self) -> list[int]:
-        """Get lengths of the dataset samples."""
-        return list(self.data.with_format(None)["seq_len"])
+    def _compute_approx_lengths(self) -> np.ndarray:
+        """Get lengths of the dataset samples.
+
+        Columnar read of the ``seq_len`` column. ``ArrowDataset``
+        materializes its split via ``select(range(start, stop))``; in
+        datasets 5.x a contiguous-range select materializes directly into
+        ``.data`` (no indices mapping), so ``.data.column`` is already
+        exactly this split's rows. When an indices mapping IS present
+        (non-contiguous selects — a one-column table in datasets 5.x),
+        it is gathered explicitly. Reading via ``ds["seq_len"]`` instead
+        returns a lazy column view whose iteration walks every row through
+        the datasets formatter (~100-200K rows/s — tens of minutes on the
+        212M-row fineweb mix); the columnar read is ~1s for the same column.
+        """
+        seq_len = np.asarray(self.data.data.column("seq_len"))
+        indices = self.data._indices
+        if indices is not None:
+            seq_len = seq_len[indices.column(0).to_numpy(zero_copy_only=False)]
+        return seq_len
 
     def _generate_hidden_states_once(
         self,

@@ -308,3 +308,57 @@ artifacts under `/data/playground/reed-meyerson/fineweb-pretrain-run/`.
 
 **Outstanding:** GPU smoke test (50 steps, saves at 20/40, boundary val)
 then the launch — both via `canhazgpu run`, on user go.
+
+## Entry 11: columnar seq_len read in `_compute_approx_lengths`
+
+**Problem.** The fineweb smoke launch (50-step preflight for entry 10's mix)
+sat ~25 min at 100% CPU with idle GPUs before training ever started. py-spy:
+`ArrowDataset._compute_approx_lengths` — `list(ds.with_format(None)["seq_len"])`
+— grinding inside the datasets formatter (`extract_row` ← `format_row` ←
+`format_table` ← `Dataset.__iter__`). In datasets 5.x, `ds["col"]` on an
+indices-mapped dataset returns a lazy column view whose iteration walks every
+row through the formatter: ~100-200K rows/s. Unnoticed on the 1.74M-row chat
+corpus (~15s), it is ~35 min on the 212M-row mixed corpus — paid by every
+launch, train and val alike.
+
+**Change.** `ArrowDataset._compute_approx_lengths` (train/data.py) now reads
+the column columnar — `np.asarray(self.data.data.column("seq_len"))` —
+returning an ndarray (the only consumer,
+`MultipackDistributedBatchSamplerV2.__init__`, immediately does
+`np.array(lengths)`, so behavior is identical). Measured on the staged mix:
+0.7s for the full 212M-row column (~3000x). In datasets 5.x a
+contiguous-range `select` materializes directly into `.data` (no indices
+mapping), so `.data.column` is already exactly this split's rows; a
+non-contiguous select leaves a one-column-table indices mapping, which is
+gathered explicitly (`indices.column(0).to_numpy(zero_copy_only=False)` —
+`np.asarray(indices)` is WRONG, it nests to shape (1, n)).
+
+**Regression caught by the smoke run (first attempt).** The initial version
+of this change sliced the full pre-select column by
+`[start_file_idx : start_file_idx + len(data)]`, on the belief that
+`select(range(start, stop))` keeps `.data` untouched and maps rows via
+indices. Wrong for datasets 5.x: select MATERIALIZES. Consequence: the train
+split (start=0) was coincidentally correct, but the val split's `.data` was
+already only 53,432 rows, so slicing at `[212,228,441 : ...]` yielded ZERO
+lengths → `len(val_loader) == 0` → every val pass ran 0 batches and wrote
+`{}` to val_metrics.json while training happily proceeded. The 50-step smoke
+run surfaced it immediately (train metrics fine, val absent) — exactly what
+a smoke run is for. An equivalence check against the old path had passed
+before launch, but it exercised the pre-select dataset's `.data`, not the
+post-select `.data` the class actually reads — lesson recorded: verify the
+exact class codepath, not a hand-replicated expression.
+
+**Verification (post-fix).** Exact class expression on the real mix:
+train 212,228,441 lengths / 199,056,254,952 tokens and val 53,432 /
+50,363,514 tokens (exactly the staged val-tail file, entry 10); a 3000-row
+window per split is element-equal to the old row-by-row path; the
+non-contiguous-select gather is element-equal to the old path; val sampler
+len() = 523 rank-0 batches.
+
+**Also measured (startup budget for the real run).** The multipack
+`_assign_to_packed_batches` loop over the full 212M rows extrapolates to
+~12 min per rank (13.8s on a 4M-row subsample; ranks pack independently in
+parallel, cached per epoch) — now the dominant one-time startup cost after
+the fix.
+
+**Outstanding:** relaunch the smoke test on the corrected path.
