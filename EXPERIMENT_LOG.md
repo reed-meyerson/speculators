@@ -409,3 +409,74 @@ are unchanged.
 **Outstanding:** smoke run 3 with both fixes (entry 11's lengths + this) —
 expect the step-20 boundary: checkpoint save → val pass over 523 batches →
 resume training to step 40 → save/val → finish at 50.
+
+### 13. 2026-09-30 — real run launched: stage-1 token-only pretraining on 8×H200
+
+**What's running.** The staged FineWeb mix (entry 10) on all 8 H200s under a
+24h manual `canhazgpu` hold (renewable — multi-day run), launched from tmux
+via `MANUAL_HOLD=1 CUDA_GPUS=0,...,7 ~/launch-pretrain.sh` →
+`torchrun --standalone --nproc_per_node 8`, stdout tee'd to
+`fineweb-pretrain-run/logs/train.log` (rotated per launch). Config is the
+staged pretrain config with two 8-rank adaptations: warmup **51 steps**
+(10.03M tokens at 196,608 global tok/step — the ~10M-token warmup budget
+preserved in tokens, since the global batch doubles) and
+`checkpoint_freq 0.0064` (see the cadence note below).
+
+**Throughput (steady state, steps ~100–400):**
+
+| | distill 4+4 (entry 2) | token-only 4×H200 (smoke) | token-only 8×H200 (this) |
+|---|---|---|---|
+| global tok/s | ~30,100 | ~90,000 | **~190–195K** |
+| per-GPU tok/s | ~3,760 | ~22,500 | ~24,200 |
+| step_ms | ~990–1080 | ~1060 | ~1010–1060 |
+| fwd/bwd/opt/fetch ms | 185/215/320/22 | 305/524/228/4.5 | 308/533/193/7 |
+
+- **2.08× on 2× GPUs** vs the 4-rank smoke (~94K → ~195K global tok/s,
+  slightly superlinear): per-rank work per step is unchanged (same 24,576
+  tokens/rank), so the scaling arrives as 2× tokens per step at the same
+  ~1.0 s step time, with FSDP 8-way halving the live shard footprint.
+- **6.5× the baseline distillation setup** (entry 2's 4 vLLM server + 4
+  training) on the same 8 GPUs: ~195K vs ~30.1K global tok/s. The
+  verifier-free design is why stage 1 can chew 199B tokens in ~12 days
+  instead of ~77: ~16.9B tokens/day; full epoch ≈ 11.8 days (premature stop
+  planned).
+- Step components sum to step_ms (no unaccounted time — the hs-pipeline
+  overhead of the distill baseline stays absent at 8 ranks).
+
+**Early trajectory** (first ~400 steps ≈ 79M tokens): train loss 6.55 → 2.87,
+accept_rate → 0.063, eal 1.26, position accs ~0.15. (Smoke's step-50 numbers
+for contrast: loss 3.96, accept 0.013 — this run has seen ~40× more tokens.)
+
+**Operational notes:**
+
+- Startup at 8 ranks: ~3 min model load, 0.7 s lengths (entry 11), ~16 min
+  multipack (8 ranks contend for memory bandwidth; 12.5 min at 4), 96
+  dataloader workers spawning, ~2 min compile → first step ~22 min after
+  launch (11:56:17 → ~12:18).
+- **Checkpoint cadence landed at ~108 min + val, not ~60**: the 8-rank
+  `checkpoint_freq` was computed under the assumption that 2× throughput
+  means 2× steps/s — it actually means 2× tokens per step at unchanged
+  ~1.0 s/step. `checkpoint_freq` is fixed at startup; decision was to leave
+  it running (~1.8 h boundary cadence: 6,480 steps ≈ 108 min train + ~30 s
+  save + ~2 min val over ~256 fwd batches/rank) rather than pay a ~25 min
+  restart. First boundary: step 6,480.
+- Memory: 108–132 GB/GPU steady, asymmetric by rank (0–3 high) — consistent
+  with entry 2's 24576/3072 allocator growth on packed-shape variety
+  (mostly cache; live state is small: frozen embed, 8-way shards, Muon/AdamW
+  states on ~0.46B trainable params). No allocator OOM-retry warnings so
+  far. Val at boundaries reuses the cache (observed at 4 ranks, smoke run 3).
+- Entry 12 fix in production: 96 dataloader workers with **zero** CUDA
+  contexts (would have been ~7.4 GB/GPU of dead contexts and the val-spawn
+  crash vector at 8 ranks too).
+- The 24h reservation expires ~11:55 next day; renew with
+  `canhazgpu reserve` before expiry for the multi-day run.
+
+**Reproducibility:** branch @ this commit (untracked config
+`configs/qwen38-dspark-pretrain-fineweb.yaml`: 24576/3072, Muon 1e-3,
+constant LR + 51-step warmup, `checkpoint_freq 0.0064`, keep 3, epochs 1,
+FSDP ×8, `train_data_ratio 0.9997482969259462`); dataset = entry 10's mix.
+Env: torch 2.13.0+cu130, Python 3.12, CUDA 13.0, 8× H200 141GB.
+
+**Outstanding:** first checkpoint+val boundary at step 6,480 (~108 min in)
+— verify rotation, non-empty val metrics, and val-loss trend for the
+premature-stop decision; reservation renewal.
