@@ -225,3 +225,86 @@ fingerprint cache (the ~1.1TB map output lives in the HF datasets cache on
 hygiene: `prepare-data` skips an output dir that contains any `*.arrow`, so a
 partial save must be wiped before relaunch (the driver does not pass
 `--overwrite`).
+
+## Entry 10: mixed pretraining corpus staged — custom parallel writer + val-tail microcosm
+
+**Problem.** With all nine sources prepared (entry 9's parallel save finished
+the job: EN 97.27M rows / 99.55B tokens in ~7 min, the eight FineWeb-2
+languages 209.77M docs total in ~2h), the mix phase — select rows to the
+token-exact budget (1/2 EN + 1/16 × 8, 199.11B tokens, 212,281,873 rows) and
+write ONE combined dataset dir — stalled in `datasets`' `save_to_disk`
+machinery: py-spy showed the parent grinding serially inside the
+`kwargs_per_job` generator (`shard()` → `select` → `Dataset.__init__` →
+`update_metadata_with_features` → `ConcatenationTable` rebuild →
+`table.to_batches()`), ~30-60s+ per shard × 4,653 shards = days. The forked
+write workers were healthy; the parent-side per-shard metadata rebuild over
+the ~6,800-block combined table is simply O(shards × blocks). `flatten_indices`
+and `num_shards` variants share the same parent-side path.
+
+**Key enabler.** The trainer's `MultipackDistributedBatchSamplerV2.__iter__`
+re-permutes ALL rows every epoch (`rng.permutation`, seed + epoch). On-disk
+row order is therefore irrelevant to training — the mix can be written in
+sequential coarse-interleaved order with no random gather and no datasets
+indices machinery at all.
+
+**Design (driver `~/fineweb-pretrain-data/prep_and_mix.py`, outside the fork
+per convention; config+script paths untracked).**
+
+- Per source: seeded first-crossing row selection to the token budget, then
+  **sorted** row ids — every source read becomes a sequential scan (the
+  selection itself already fixes WHICH rows; sorting only fixes the order).
+- Interleave: selected rows chunked into ~45K-row (~500MB) single-source
+  files, round-robin across sources (en, cmn, jpn, kor, rus, arb, spa, fra,
+  deu, repeat; depleted sources drop out).
+- Write: plain stdlib `multiprocessing.Pool` (120 workers) of
+  `datasets.arrow_writer.ArrowWriter` shard writers. Each worker takes its
+  file's sorted rows **per memory-mapped block** (`t.table.take(m - a)`, then
+  `pa.concat_tables`): a take on the combined >2GB source table overflows
+  pyarrow's int32 list offsets ("offset overflow while concatenating
+  arrays"), while per-block takes stay under the limit, and sorted ids make
+  the per-block parts concatenate directly in order. `state.json` +
+  `dataset_info.json` are written by hand in the exact layout
+  `save_to_disk` produces (`_data_files` list + torch row format;
+  `load_from_disk` only reads `_data_files` — the `dataset_info` splits
+  block, e.g. the stale 984-entry `shard_lengths` in the EN dir, is
+  informational).
+- **Val tail:** the trainer splits val as the contiguous tail
+  `data[int(len × train_data_ratio):]` — with round-robin interleaving, the
+  file-order tail is ALL-EN (EN has 2,162 chunks vs ~300-370 per other
+  language), so a naive tail slice would be an English-only val. Instead the
+  FINAL file is a proportional microcosm: per source, the last rows of its
+  selection summing to its token share of the 50M-token val budget
+  (53,432 rows / 50,363,514 tokens), one multi-source file.
+  `train_data_ratio = (rows − val_rows)/rows = 0.9997482969259462` lands the
+  split exactly on that file boundary (verified on the staged dir).
+
+**Verification.** (a) Mechanism dry-run on real data: two sources, 4
+interleaved files via the per-block take + ArrowWriter path — row-level
+equality against direct takes, torch format carried, `load_from_disk`
+round-trip clean. (b) 1B- and 2B-token end-to-end smoke runs: exact
+rows/tokens vs the report; per-file average `seq_len` matches each source's
+signature in round-robin order; final-file sliding-window bands show the
+multilingual microcosm; trainer-split lands exactly on the val boundary.
+(c) Full run: 212,281,873 rows / 199,106,618,466 tokens / 4,723 files /
+2.39TB in 19 min (peak 4.1 files/s ≈ 2 GB/s), deterministic across reruns
+(identical totals). `mix_report.json` at `fineweb-prepared/` carries
+per-source `{fraction, token_budget, tokens_used, rows}` + totals + val
+tail + `train_data_ratio`.
+
+**Corpus (staged, final).** EN takes ALL 99.55B tokens (budget-binding at
+2×EN); each FineWeb-2 language 12.444B. Train side 199.056B tokens
+(~2.03M steps at 98,304 global tokens/step, ~99% packing), val 50.36M
+(~512 fwd-only steps, ~3 min per hourly boundary).
+
+**Run config (untracked, `configs/qwen38-dspark-pretrain-fineweb.yaml`) +
+launcher (`~/launch-pretrain.sh`, canhazgpu-run integrated with a
+MANUAL_HOLD escape hatch; `~/launch-smoke.sh` for the 50-step smoke).**
+Constant LR 1e-3 + warmup 100 steps (~10M tokens); epochs 1 as an upper
+bound only (~25 days at 0.94 steps/s — premature stop planned, then entry
+7's cooldown); `checkpoint_freq: 0.001655` (~3,383 steps ≈ hourly),
+`checkpoint_keep: 3`; validation rides each checkpoint boundary (entry 6).
+Batch geometry 24576/3072 (1:8), FSDP shard, Muon 1e-3, trackio logging;
+artifacts under `/data/playground/reed-meyerson/fineweb-pretrain-run/`.
+
+**Outstanding:** GPU smoke test (50 steps, saves at 20/40, boundary val)
+then the launch — both via `canhazgpu run`, on user go.
