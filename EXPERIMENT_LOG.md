@@ -480,3 +480,94 @@ Env: torch 2.13.0+cu130, Python 3.12, CUDA 13.0, 8× H200 141GB.
 **Outstanding:** first checkpoint+val boundary at step 6,480 (~108 min in)
 — verify rotation, non-empty val metrics, and val-loss trend for the
 premature-stop decision; reservation renewal.
+
+### 14. 2026-10-01 — `trainer.skip_steps`: data-stream continuation; pretrain stopped at V16, FineWeb linear cool-down launched
+
+**Decision.** The 40h constant-LR pretrain (entry 13) was deliberately
+stopped ~32.6h in (step 108,004, ~21.2B tokens) per user call, and the
+annealing experiment pulled forward ONTO THE SAME WEB STREAM: a linear
+cool-down 1e-3 → ~0 over 2B tokens (10,173 steps at 8 ranks / 196,608
+tok/step) warm-started from **V16** (step 104,768, 20.60B tokens, val loss
+2.1582 / eal 1.6181 / p0 0.3564 — the 16th consecutive new-best boundary).
+This is the clean ablation of entry 7's chat-corpus cool-down: pure
+on-distribution LR annealing, no distribution-transfer confound. The
+pretrain remains resumable with ZERO repeated data (recipe below).
+
+**The stop.** Ctrl-C via `tmux send-keys` killed the torchrun process group
+WITHOUT the graceful-shutdown `interrupted/` save (workers died on group
+SIGINT before `TrainingInterruptedError` could fire; no partial writes —
+the last boundary save to `0/` was V16 at 18:29–18:31). The ~3.2K steps
+trained past V16 exist only in discarded (never-written) state, so the
+retained trajectory is exactly V16-weights + data-from-batch-104,769.
+Operational lesson: deliberate stops should rely on boundary checkpoints
+(or signal the driver PID alone), not tmux-forwarded group SIGINT.
+
+**The feature — `trainer.skip_steps` (this commit).** On a fresh run (no
+checkpoint consumed), fast-skip the first N train batches of the run's
+first epoch before step 0, reusing the mid-epoch resume fast-skip: the
+sampler's pre-generated batch list is sliced `_generate_batches(epoch)[N:]`
+and re-cached — no data is loaded for skipped batches, and `local_step`
+bookkeeping continues from the true epoch position (mid-run checkpoints
+record true positions, so the skipping run is itself mid-epoch-resumable).
+Run-local counting (global_step, scheduler horizon, max_steps) starts at 0.
+Setting it alongside a resume logs a warning and is ignored; skip ≥ epoch
+length raises. Why the stream is EXACT: the epoch-0 batch sequence is a
+pure function of (dataset+split, DP size, batch_max_length, epoch) —
+permutation `np.default_rng(0 + epoch)` over valid_indices (the sampler
+seed is not plumbed from train seed; it is the default 0), split is the
+deterministic prefix cut `int(len × train_data_ratio)`, LPT packing is
+RNG-free. With identical data_path / ratio / 24576 / 8 DP ranks /
+max_batches=None, `batches[104768:]` is bit-identical to what the pretrain
+would have trained next: the cool-down's first batch is the pretrain's
+batch 104,769.
+
+**The cool-down run.** Untracked config
+`configs/qwen38-dspark-cooldown-fineweb.yaml` + `~/launch-cooldown-fineweb.sh`
+(manual-hold pattern, 8 ranks); fresh save_path
+`/data/playground/reed-meyerson/fineweb-cooldown-run/` (pretrain dir
+untouched, per the keep-it-resumable requirement); warm start = reflink
+snapshot of V16 into `warm-start/` (decouples from pretrain checkpoint
+rotation); fresh Muon at peak LR, warmup 0; linear descent over
+scheduler_total_tokens 2e9; checkpoint_freq 0.0024 (~2,456 steps ≈ 42 min;
+boundaries at cooldown steps ~840 / 3,296 / 5,752 / 8,208 + final);
+same val split → series directly comparable to V1–V16. Smoke run
+(8 ranks, skip 200, max_steps 3, own save_path/run-name) validated the full
+path — and caught two things: (1) explicit draft-definition keys (e.g.
+`num_layers`) are REJECTED alongside `from_pretrained` — a latent bug in
+entry 7's never-launched chat-cooldown config, fixed in both configs; (2) a
+fresh-optimizer transient on the confidence head: after 3 steps at peak LR,
+val `loss_epoch` was 2.179 vs V16's 2.158 — but `loss_epoch` = ce_token +
+confidence_loss, and decomposing shows the CE component essentially
+IDENTICAL (1.9946 vs 1.9963) with all argmax slots / eal / accept_rate at
+or slightly above V16 (trunk warm-start exact; p-slots +0.0005 from the 3
+steps). The +0.021 is entirely the confidence head (a small AdamW-only
+head whose pred_mean swung 0.157 → 0.067 → 0.148 across the 3 train steps
+with empty optimizer state). Applied entry 7's contingency:
+`scheduler_warmup_steps: 100` (~1% of budget), and the cooldown tracks
+`loss − confidence_loss` / eal / p0 as its clean early signals.
+
+**Pre-registered expectations (40h-stop analysis, entries 13/14):** the
+constant-LR fit put the loss floor at ~2.118 and current trend at
+~2.155–2.158 at the 40h mark. A 2B linear anneal should capture part of the
+0.04-nat constant-LR→floor gap: final val loss ~2.13–2.15 (at least
+−0.008 vs V16), monotone-ish descent tracking LR; eal 1.615–1.630 (flat to
++0.012 — V16 was the first non-positive eal cycle; annealing usually
+sharpens argmax alignment); p0 0.356 → 0.360–0.365.
+
+**Picking the pretrain back up (no repeated data):** copy the pretrain's
+`checkpoints/0` (V16) to a fresh dir, edit its `training_state.json`
+local_step/global_step 104768 → 114941 (= 104,768 + 10,173 cool-down
+steps), keep optimizer/scheduler state, relaunch the pretrain config with
+`save_path` pointed there (same 8-rank geometry; this commit is purely
+additive vs the run's launch SHA e7c7248, so either tree works).
+Auto-resume fast-skips to 114,941 and continues constant-LR training; Muon
+moments are 10,173 steps stale (negligible at constant LR this late).
+
+**Reproducibility:** branch @ this commit; dataset = entry 10's mix; warm
+start = V16 snapshot (`fineweb-cooldown-run/warm-start/`); env unchanged
+(torch 2.13.0+cu130, 8× H200 141GB, manual hold).
+
+**Outstanding:** monitor the 4 boundaries + final (~2.9h train + ~15 min
+overhead); compare against pre-registered expectations; then decide the
+stage-1b endpoint (this anneal vs entry 7's chat cool-down) before stage-2
+conversion (entry 8) + hs distillation.

@@ -134,6 +134,7 @@ class TrainerConfig(NamedTuple):
     num_epochs: int
     save_path: str
     resume_from_checkpoint: bool = False
+    skip_steps: int = 0
     train_call_kwargs: dict | None = None
     val_call_kwargs: dict | None = None
     optimizer: Literal["adamw", "muon"] = "adamw"
@@ -258,7 +259,9 @@ class Trainer:
         return {}
 
     def setup_trainer(self):
+        consumed_checkpoint_state = False
         if self.checkpointer.previous_epoch != -1:
+            consumed_checkpoint_state = self.resume_from_checkpoint
             root_logger.info(f"Found checkpoint at {self.checkpointer.prev_path}.")
             self.current_epoch = self.checkpointer.previous_epoch + 1
             if self.resume_from_checkpoint:
@@ -307,6 +310,27 @@ class Trainer:
             self._resume_global_step = 0
         self.global_step = self._resume_global_step
         self.best_val_loss = float("inf")
+
+        # Data-stream continuation for warm-started fresh runs: reuse the
+        # mid-epoch resume fast-skip to discard the first N batches of this
+        # run's first epoch. Only meaningful when no checkpoint state was
+        # consumed (fresh start, optionally overwriting an existing dir).
+        if self.config.skip_steps > 0:
+            if consumed_checkpoint_state:
+                root_logger.warning(
+                    "skip_steps=%s is set but the run resumed from a checkpoint; "
+                    "the resume position takes precedence and skip_steps is "
+                    "ignored.",
+                    self.config.skip_steps,
+                )
+            else:
+                self._resume_local_step = self.config.skip_steps
+                root_logger.info(
+                    "skip_steps=%s: fast-skipping that many leading train "
+                    "batches of the first epoch (data-stream continuation); "
+                    "run-local step counting still starts at 0.",
+                    self.config.skip_steps,
+                )
 
         if self.resume_from_checkpoint and self.checkpointer.previous_epoch != -1:
             saved = self.checkpointer.load_best_val_loss()
@@ -462,6 +486,11 @@ class Trainer:
         )
         if skip_steps > 0 and has_fast_skip_api:
             all_batches = sampler._generate_batches(epoch)  # type: ignore[union-attr]  # noqa: SLF001
+            if skip_steps >= len(all_batches):
+                raise ValueError(
+                    f"Requested skip of {skip_steps} batches meets or exceeds the "
+                    f"epoch's {len(all_batches)} batches; nothing would be trained."
+                )
             remaining = all_batches[skip_steps:]
             # Temporarily override the sampler cache with the sliced list.
             sampler._cached_generated_batches = (  # type: ignore[union-attr]  # noqa: SLF001

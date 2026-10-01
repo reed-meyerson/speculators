@@ -426,6 +426,20 @@ class TrainerArgs(_Group):
     no_resume_from_checkpoint: bool = Field(
         default=False, description="Do not resume training from an existing checkpoint."
     )
+    skip_steps: int = Field(
+        default=0,
+        ge=0,
+        description="On a fresh run (no checkpoint consumed), fast-skip the first N "
+        "train batches of the run's first epoch before step 0 — a data-stream "
+        "continuation for warm-started runs, reusing the mid-epoch resume "
+        "fast-skip (sampler-list slice; no data is loaded for skipped batches). "
+        "The stream position is a pure function of (dataset + split, DP size, "
+        "batch_max_length, epoch), so a fresh run with identical geometry and "
+        "skip_steps=<steps completed by a previous run> picks up exactly where "
+        "that run left off, with no repeated data. Run-local step counting "
+        "(global_step, scheduler horizon, max_steps) still starts at 0. Ignored "
+        "(with a warning) when a checkpoint is resumed.",
+    )
     log_freq: int = Field(
         default=1, description="Log training metrics every N steps (default: 1)."
     )

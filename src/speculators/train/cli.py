@@ -778,6 +778,7 @@ def main(cfg: TrainConfig):  # noqa: C901
         save_path=args.save_path,
         lr=args.lr,
         resume_from_checkpoint=not args.no_resume_from_checkpoint,
+        skip_steps=args.skip_steps,
         train_call_kwargs=train_call_kwargs,
         val_call_kwargs=val_call_kwargs,
         optimizer=args.optimizer,
