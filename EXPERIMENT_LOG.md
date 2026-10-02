@@ -632,3 +632,48 @@ warm-start/`); untracked config `configs/qwen38-dspark-cooldown-fineweb.yaml`
 Muon, checkpoint_freq 0.0024, 8 ranks); launcher `~/launch-cooldown-fineweb.sh`;
 dataset = entry 10's mix; code @ 63fe7df + this commit; env unchanged
 (torch 2.13.0+cu130, 8× H200 141GB).
+
+### 16. 2026-10-02 — stage-2 hidden-states pool: one capture serves the whole layer-ID search
+
+**What/why.** The layer-ID search (stage 2) trains 5-layer-subset drafts
+against pre-captured on-policy verifier hidden states, comparing val eal.
+Rather than re-prefilling the corpus per candidate subset, capture **one
+17-slot pool** — the union of every subset worth trying — and slice slots
+by id at train time (entry 17). Pool ids: `0` (embeddings — Qwen layer 0
+consumes the unscaled embedding, so id 0 is an exact `embed_tokens` gather)
+and `4, 8, …, 64` (all 16 full-attention block outputs; ≡0 mod 4 because
+full-attention sits at 0-indexed 3, 7, …, 63 and hidden state after layer
+i carries id i+1). Id 64 doubles as the verifier target, matching the
+online path's convention.
+
+**Row sets.** `scripts/capture_pool.py compute` replicates the training
+stream exactly: the sampler's epoch permutation (seed 0 — the class
+default, not the config seed) over the entry-10 arrow dataset, packed by
+the same LPT window logic (`_assign_to_packed_batches` outer loop with an
+early break; the window is rank-independent, so the prefix of permuted
+rows is the union over all 8 DP ranks). Cross-validated against the real
+`MultipackDistributedBatchSamplerV2` (full packing × 8 ranks, union of
+first-N batches == simulated prefix; exact match on synthetic data and on
+the real train/val splits). Budgets: 1,606 train steps = 100.07M tokens
+(95% LPT utilization — nominal 65,536 tok/step is wrong for step math),
+161 val steps = 10.00M tokens, +8-step prefetch margins. Total: 45,591
+rows / 111.06M tokens ≈ 19.3 TB bf16 (17 slots × 5,120 × 2 B/token).
+
+**Capture.** vLLM (TP8) with the `extract_hidden_states` speculator
+config, staging on /data; the async client driver (same request pattern
+as `generate-offline-data`) moves each finished file into the pool by
+rename and validates it (token-id match, finiteness, 17 slots).
+Resumable via existing-file skip. Measured 15.2 rows/s at concurrency
+32 — server prefill+extraction bound (concurrency 64 gave 14.3, disk
+only ~5.6 of ~13 GB/s), so the full pool is ~50 min. **Slot-0 identity
+verified bit-exact**: `hs[:, 0, :] == embed_tokens[token_ids]` (max|diff|
+0.0 on sampled files) — the capture mechanism is sound end-to-end.
+`pool_manifest.json` in the pool dir records the capture order of layer
+ids + verifier id; `ArrowDataset` reads it (entry 17).
+
+**Reproducibility:** rows at `/data/playground/reed-meyerson/
+layer-id-search/rows.json`, pool + manifest under `layer-id-search/
+hidden_states/`; server via `launch_vllm.py … --target-layer-ids 0 4 8
+12 16 20 24 28 32 36 40 44 48 52 56 60` (launch auto-appends 64);
+untracked launcher `~/launch-pool-server.sh`; code @ this commit.
+
