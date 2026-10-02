@@ -1,3 +1,4 @@
+import json
 import logging
 import warnings
 from collections.abc import Callable, Sequence
@@ -171,6 +172,7 @@ class ArrowDataset(BaseDataset):
         generation_validation_retries: int = 2,
         max_consecutive_generation_failures: int = 20,
         require_hidden_states: bool = True,
+        target_layer_ids: list[int] | None = None,
     ):
         self.data = load_from_disk(datapath)
         if not 0.0 < train_ratio <= 1.0:
@@ -206,11 +208,53 @@ class ArrowDataset(BaseDataset):
         )
         self.require_hidden_states = require_hidden_states
 
+        # On-disk slot layout: None keeps the legacy positional convention
+        # (every slot but the last feeds the fc, the last is the verifier
+        # target); a pool_manifest.json in the hidden-states directory switches
+        # to id-based selection so one multi-slot capture can serve any layer
+        # subset (scripts/capture_pool.py writes the manifest).
+        self.slot_map = (
+            self._resolve_slot_map(target_layer_ids)
+            if require_hidden_states
+            else None
+        )
+
         # Delay super init so that `_compute_approx_lengths` has required data
         super().__init__(max_len, transform, hidden_states_dtype)
 
     def _map_to_file_idx(self, index: int):
         return index + self.start_file_idx
+
+    def _resolve_slot_map(
+        self, target_layer_ids: Sequence[int] | None
+    ) -> tuple[list[int], int, int] | None:
+        """Map layer ids to slot positions in the on-disk hidden-state files.
+
+        Returns ``(fc_positions, verifier_position, num_slots)`` when the
+        hidden-states directory carries a ``pool_manifest.json``; ``None``
+        keeps the legacy positional convention, which matches files captured
+        online for exactly this draft's layer list.
+        """
+        hs_path = getattr(self.transfer, "hidden_states_path", None)
+        manifest_path = Path(hs_path) / "pool_manifest.json" if hs_path else None
+        if manifest_path is None or not manifest_path.is_file():
+            return None
+        if not target_layer_ids:
+            raise ValueError(
+                f"{manifest_path} requires id-based slot selection, but the draft "
+                "model has no target_layer_ids."
+            )
+        manifest = json.loads(manifest_path.read_text())
+        order = [int(x) for x in manifest["layer_ids"]]
+        missing = [lid for lid in target_layer_ids if lid not in order]
+        if missing:
+            raise ValueError(
+                f"target_layer_ids {missing} are not captured in {manifest_path} "
+                f"(captured: {order})."
+            )
+        fc_positions = [order.index(int(lid)) for lid in target_layer_ids]
+        verifier_position = order.index(int(manifest["verifier_layer_id"]))
+        return fc_positions, verifier_position, len(order)
 
     def _setup_client(self):
         client = openai.OpenAI(
@@ -365,14 +409,30 @@ class ArrowDataset(BaseDataset):
                 reason=f"Cached token ids do not match sample {index}"
             )
 
-        return {
-            "hidden_states": loaded_hs["hidden_states"][:, :-1].flatten(
+        if self.slot_map is not None:
+            fc_positions, verifier_position, num_slots = self.slot_map
+            all_hs = loaded_hs["hidden_states"]
+            if all_hs.shape[1] != num_slots:
+                raise ValueError(
+                    f"Hidden-state file for index {index} has {all_hs.shape[1]} "
+                    f"slots; pool_manifest.json declares {num_slots}."
+                )
+            hidden_states = all_hs[:, fc_positions].flatten(
                 1
-            ),  # [seq_len, 3 * hidden_size]
-            "input_ids": loaded_hs["token_ids"],  # [seq_len]
-            "verifier_last_hidden_states": loaded_hs["hidden_states"][
+            )  # [seq_len, num_target_layers * hidden_size]
+            verifier_hs = all_hs[:, verifier_position]  # [seq_len, hidden_size]
+        else:
+            hidden_states = loaded_hs["hidden_states"][:, :-1].flatten(
+                1
+            )  # [seq_len, 3 * hidden_size]
+            verifier_hs = loaded_hs["hidden_states"][
                 :, -1
-            ],  # [seq_len, hidden_size]
+            ]  # [seq_len, hidden_size]
+
+        return {
+            "hidden_states": hidden_states,
+            "input_ids": loaded_hs["token_ids"],  # [seq_len]
+            "verifier_last_hidden_states": verifier_hs,
             "loss_mask": self.data[index]["loss_mask"],  # [seq_len]
         }
 

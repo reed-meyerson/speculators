@@ -231,6 +231,19 @@ class DataArgs(_Group):
         description="Maximum anchor positions for DFlash-family and P-EAGLE training "
         "(default: 512).",
     )
+    max_train_batches: int | None = Field(
+        default=None,
+        ge=1,
+        description="Cap the train sampler at this many optimizer steps per epoch. "
+        "Bounds token-denominated mini-experiments to a fixed stream prefix and "
+        "makes the scheduler resolve from the actual horizon. None = full epoch.",
+    )
+    max_val_batches: int | None = Field(
+        default=None,
+        ge=1,
+        description="Cap validation at this many batches per pass, for a small "
+        "fixed val subset shared across runs. None = full split.",
+    )
 
     @field_validator("hidden_states_dtype")
     @classmethod

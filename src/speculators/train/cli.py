@@ -736,7 +736,10 @@ def main(cfg: TrainConfig):  # noqa: C901
         prefetch_factor=args.prefetch_factor,
         preprocess=preprocess,
         train_data_ratio=args.train_data_ratio,
+        max_train_batches=args.max_train_batches,
+        max_val_batches=args.max_val_batches,
         require_hidden_states=not draft_model.token_only_data(args.loss_fn),
+        target_layer_ids=draft_model.target_layer_ids,
     )
 
     # Get trainer kwargs from model class

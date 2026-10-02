@@ -129,7 +129,9 @@ def create_train_val_loaders(
     preprocess: Callable[[BatchType], BatchType] | None,
     train_data_ratio: float = 0.9,
     max_train_batches: int | None = None,
+    max_val_batches: int | None = None,
     require_hidden_states: bool = True,
+    target_layer_ids: list[int] | None = None,
 ) -> tuple[DataLoader, DataLoader]:
     """Create training and validation DataLoaders.
 
@@ -166,6 +168,7 @@ def create_train_val_loaders(
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
         require_hidden_states=require_hidden_states,
+        target_layer_ids=target_layer_ids,
     )
     val_dataset: BaseDataset = ArrowDataset(
         datapath=data_path,
@@ -183,6 +186,7 @@ def create_train_val_loaders(
         generation_validation_retries=generation_validation_retries,
         max_consecutive_generation_failures=max_consecutive_generation_failures,
         require_hidden_states=require_hidden_states,
+        target_layer_ids=target_layer_ids,
     )
 
     train_loader = _setup_dataloader(
@@ -204,6 +208,7 @@ def create_train_val_loaders(
         num_workers=num_workers,
         prefetch_factor=prefetch_factor,
         preprocess=preprocess,
+        max_batches=max_val_batches,
         worker_bind_device=worker_bind_device,
     )
 

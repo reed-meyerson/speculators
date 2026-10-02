@@ -677,3 +677,39 @@ hidden_states/`; server via `launch_vllm.py … --target-layer-ids 0 4 8
 12 16 20 24 28 32 36 40 44 48 52 56 60` (launch auto-appends 64);
 untracked launcher `~/launch-pool-server.sh`; code @ this commit.
 
+### 17. 2026-10-02 — bounded mini-experiments + manifest-based slot selection
+
+**What/why.** Two surgical library changes so the layer-ID search runs as
+100M-token mini-experiments over the entry-16 pool:
+
+1. **`max_train_batches` / `max_val_batches`** (DataArgs → cli →
+   `create_train_val_loaders`; train side was already plumbed in the
+   dataloader, val side and the config fields are new). 1,606 train
+   batches makes `len(train_loader)` the true horizon — the LR schedule
+   resolves from it (epochs × len), and the run consumes exactly the
+   captured 100.07M-token prefix (no `scheduler_total_tokens`: it assumes
+   nominal 65,536 tok/step vs the actual ~62.3K LPT-packed, and would
+   misalign schedule and pool). 161 val batches gives one fixed ~10.0M-
+   token val subset — the same first-161-permutation-batches for every
+   candidate, since the sampler is seeded and epoch-0 deterministic.
+   `on_missing=skip` was rejected for val bounding: it emits placeholder
+   batches that pollute eal.
+
+2. **Id-based slot selection** (`ArrowDataset.target_layer_ids`). The old
+   `[:, :-1]` / `[:, -1]` slicing assumes files carry exactly this
+   draft's layers + verifier. With `pool_manifest.json` present, slots
+   are selected by layer id (config order preserved — the same order
+   `expand_target_layers.py` warm-start assumes), with validation (ids ⊆
+   captured; per-file slot count). No manifest → legacy positional
+   convention; the online-generation path is untouched. Token-only
+   datasets skip resolution entirely.
+
+**Tests.** Slot selection bit-identical to manual file slices (5-layer
+subset → fc `[seq, 25,600]`, verifier `[seq, 5,120]`); loader lengths 4/2
+under `max_train_batches=4`/`max_val_batches=2`; collate widths and
+bfloat16 dtype through a real packed batch; CLI mirror
+(`--max-train-batches`/`--max-val-batches`); error paths (missing id,
+manifest without layer ids). Embedding identity in entry 16.
+
+**Reproducibility:** configs for the search runs live in `configs/`
+(untracked); code @ this commit.
