@@ -571,3 +571,64 @@ start = V16 snapshot (`fineweb-cooldown-run/warm-start/`); env unchanged
 overhead); compare against pre-registered expectations; then decide the
 stage-1b endpoint (this anneal vs entry 7's chat cool-down) before stage-2
 conversion (entry 8) + hs distillation.
+
+### 15. 2026-10-02 — cool-down results: the anneal far outperformed the pre-registration
+
+**Run.** The entry-14 cool-down ran to completion on 2026-10-01: launched
+20:04, first step ~20:22 (~18 min startup), finished 23:24 — 10,173 steps
+(~2.9 h at ~992 ms/step) + 4 boundary save/val overheads, ~3.3 h wall. The
+skip landed as designed: "Fast-skipping 104768 batches", trained the
+pretrain's batches 104,769–114,941 (2.000B tokens, zero repeated data);
+mid-run checkpoints record true stream positions (0.prev1 = local_step
+112,976 = cooldown step 8,208). Clean exit; final save at
+`fineweb-cooldown-run/checkpoints/0` (global_step 10,173, `epoch0_end` /
+`checkpoint_best` → 0; 8,208 and 5,752 boundaries kept in `0.prev1/2`).
+
+**Results** (same 50.36M-token multilingual val tail; directly comparable
+to the V1–V16 series):
+
+| point | step (cooldown) | LR | val loss | p0 | eal |
+|---|---|---|---|---|---|
+| V16 start | 0 | 1e-3 const | 2.1582 | 0.3564 | 1.6181 |
+| b1 | 840 | ~0.92e-3 | 2.141 | 0.362 | 1.637 |
+| b2 | 3,296 | ~0.68e-3 | 2.111 | 0.374 | 1.675 |
+| b3 | 5,752 | ~0.44e-3 | 2.087 | 0.383 | 1.703 |
+| b4 | 8,208 | ~0.20e-3 | 2.075 | 0.388 | 1.721 |
+| **final** | **10,173** | **→0** | **2.0726** | **0.3888** | **1.7229** |
+
+Every metric monotone at every boundary. Final slots
+0.3888/0.3403/0.2888/0.2592/0.2417/0.2304/0.2222/0.2160 (V16:
+0.3564/0.3142/0.2673/0.2411/0.2258/0.2160/0.2091/0.2036); full_acc 0.2734
+(V16 0.2542); accept_len 1.4437 (V16 1.3684); accept_rate 0.1559. The
+confidence head re-equilibrated by b1 (conf loss 0.162 ≈ V16's 0.162;
+final 0.166) — the entry-14 smoke transient was purely a fresh-optimizer
+warm-up artifact; decomposing, the CE component fell 1.996 → 1.907 (−0.090)
+and the anneal's total gain was −0.086.
+
+**vs the entry-14 pre-registration** (final loss 2.13–2.15, eal
+1.615–1.630, p0 0.360–0.365): actual 2.0726 / 1.7229 / 0.3888. The loss
+gain was ~3–10× the predicted −0.008…−0.028, landing 0.045 BELOW the
+fitted constant-LR floor (~2.118, entry 13's curve-fit). Two lessons:
+(1) a constant-LR asymptote fit is an upper bound on the annealed
+endpoint, not an estimate of it — the sharp-minima payoff of LR→0 is
+invisible to constant-LR extrapolation; (2) the V16 "eal stall" (first
+non-positive cycle, entry 13) was a constant-LR artifact, not a capacity
+limit — under annealing every argmax slot sharpened and eal recovered
++0.105, landing mid-band in entry 13's 1.70–1.80 ceiling estimate. Anneal
+shape was textbook: −0.047 of the loss gain by b2 (LR ~0.68e-3), only
+−0.002 over the final ~2,000 steps at near-zero LR — consistent with
+most of the payoff coming from mid-range LR reduction, not the last
+epsilon of descent.
+
+**Stage-1b is done.** Downstream conversion endpoint:
+`fineweb-cooldown-run/checkpoints/0`. The pretrain remains resumable with
+zero repeated data (recipe in the entry-14 config header). Open: optional
+HF push of the annealed checkpoint; stage-2 conversion (fc zero-expansion,
+entry 8) + hidden-state distillation.
+
+**Reproducibility:** warm start = V16 snapshot (`fineweb-cooldown-run/
+warm-start/`); untracked config `configs/qwen38-dspark-cooldown-fineweb.yaml`
+(linear 1e-3 → 0 over 2e9 tokens, warmup 100, skip_steps 104,768, fresh
+Muon, checkpoint_freq 0.0024, 8 ranks); launcher `~/launch-cooldown-fineweb.sh`;
+dataset = entry 10's mix; code @ 63fe7df + this commit; env unchanged
+(torch 2.13.0+cu130, 8× H200 141GB).
