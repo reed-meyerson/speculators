@@ -713,3 +713,62 @@ manifest without layer ids). Embedding identity in entry 16.
 
 **Reproducibility:** configs for the search runs live in `configs/`
 (untracked); code @ this commit.
+
+### 18. 2026-10-03 — layer-ID search resolved: depth wins; S3 {0,36,44,52,60} → full on-policy distillation launched
+
+**What ran.** Five bounded mini-experiments (entry 17's harness), one per
+candidate layer subset, each 100M tokens (1,606 batches) of on-policy
+distillation from the same zero-expanded entry-15 cool-down draft, pool-
+based (`on_missing=raise` — the entry-16 pool was complete), Muon 1e-4
+linear (10% warmup), noise off, single end-of-run val on the fixed 161-
+batch (~10M-token) subset. Subsets (all include layer 0 — the warm-start
+seam, entry 8):
+
+- S1 {0,4,20,36,52} reference-subsample; S2 {0,8,16,24,60} stride-8
+  ladder; S3 {0,36,44,52,60} high-lean; S4 {0,8,16,52,60} bimodal
+  (vs S2: only 24↔52); S5 {0,8,24,40,60} even+endpoints.
+
+**Results** (val eal; every metric — eal/accept_len/p0/ce/loss — agrees
+on the ordering; smoke's untrained-expansion baseline: 1.621):
+
+| run | val eal | p0 | ce |
+|-----|---------|-----|-----|
+| **S3 high-lean** | **2.639** | 0.686 | 1.367 |
+| S4 bimodal | 2.624 | 0.685 | 1.374 |
+| S5 even | 2.589 | 0.681 | 1.391 |
+| S2 ladder | 2.575 | 0.679 | 1.399 |
+| S1 refsub | 2.550 | 0.646 | 1.406 |
+
+**Read.** S3 beats S1 by +0.089 (~18× the ±0.005 subset noise floor).
+Both controlled swaps favor depth: S4−S2 = +0.049 (24→52) and S3−S5 =
++0.050 (high-lean vs spread). S1 — the only set without slot 60 — lands
+last with distinctly weak p0 (0.646 vs ~0.68): the top full-attention
+output (nearest the layer-64 verifier target) is load-bearing. The
+EAGLE3-style low-layer bias does not transfer to this model pair; the
+verifier's deepest layers carry the most draft-predictive signal.
+S3 vs S4 (+0.015, ~3× the floor) is the one comparison inside polite
+striking distance of noise; accepted S3 as the round-1 winner and moved
+to the full run rather than spend a refinement round on a ±1-slot grid.
+
+**Follow-on (the full run).** Re-did the cool-down on-policy before
+distilling: V16 → 100M-token token-only cool-down on the regen stream
+(509 steps, Muon 1e-3 linear→0, warmup 100; val on the regen tail:
+eal 1.916, p0 0.444, loss 1.849 — different distribution from entry 15's
+FineWeb val, not comparable) → fc zero-expansion to S3 (slot-0 block
+bit-exact, 4 zero blocks) → 1-epoch on-policy distillation: 4 train
+ranks + TP4 hidden-states server, ce 0.1/tv 0.9, Muon 1e-3, linear with
+cold-parity absolute warmup 2,867 steps over the 4.695B-token epoch,
+noise off, checkpoint/val every 7,165 steps (keep 3). Launched
+2026-10-03 20:05:47 UTC; measured 0.92 s/step (vs 1.014 on the entry-13
+8-slot cold-start — the 5-slot fc is cheaper), ETA ~44 h. Two server
+launch gotchas fixed en route: vLLM's JIT needs `ninja` (venv bin must
+be in PATH for the server process), and native max_model_len 262144
+demands 324 GB KV > the ~111 GB available at TP4 — cap `--max-model-len`
+at 8,200 (training requests are ≤8,192).
+
+**Reproducibility:** untracked configs `configs/qwen38-dspark-layerid-
+S{1..5}.yaml`, `configs/qwen38-dspark-cooldown-regen-100m.yaml`,
+`configs/qwen38-dspark-distill-regen-s3-1ep-linlr.yaml`; warm start =
+`layer-id-search/warmstarts/S{1..5}` (from entry-15 ckpt) and
+`s3-distill/warmstart` (from the on-policy cool-down); pool per entry 16;
+code @ 059165b; env unchanged.
