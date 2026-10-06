@@ -772,3 +772,58 @@ S{1..5}.yaml`, `configs/qwen38-dspark-cooldown-regen-100m.yaml`,
 `layer-id-search/warmstarts/S{1..5}` (from entry-15 ckpt) and
 `s3-distill/warmstart` (from the on-policy cool-down); pool per entry 16;
 code @ 059165b; env unchanged.
+
+### 19. 2026-10-05 — full S3 on-policy distillation complete: val eal 4.372 in one epoch
+
+**What ran.** The entry-18 plan, executed end-to-end: V16 → 100M-token
+on-policy token-only cool-down on the regen stream (end val eal 1.916,
+token-only accept semantics) → fc zero-expansion to S3 {0,36,44,52,60} →
+1-epoch on-policy distillation: ce 0.1/tv 0.9, Muon 1e-3 linear→0 with
+cold-parity absolute warmup 2,867 steps, noise off, 4 train ranks + TP4
+verifier hidden-states server (max_model_len capped 8,200 — native
+262144 wants 324 GB KV > ~111 GB at TP4), checkpoint+val every 7,165
+steps (keep 3). Exactly 143,291 steps × 32,768 tokens = 4.695B tokens,
+one pass, no repeats. Wall 44.1 h — 0.92 s/step train, 1.11 s/step
+effective including 20 vals at ~23 min each.
+
+**Results** (val = full regen tail, distillation-mode accept semantics —
+draft argmax vs verifier argmax from captured layer-64 states):
+
+- **final: eal 4.372**, accept_len 4.234, position-0 acc 0.838,
+  full-sequence acc 0.619, loss 0.425 (ce 0.708, conf 0.209)
+- trajectory (eal at each val): 3.686 @ 7.2K steps (5% in) → 3.984 @
+  21.5K (15%) → 4.282 @ 71.6K (50%) → 4.366 @ 114.6K (80%) → 4.372 @
+  129.0K (90%) → 4.372 final. Classic saturation: +0.001 over the final
+  14K steps at near-zero LR (last three vals 4.372/4.373/4.372).
+- epoch-mean train eal 5.90 vs val 4.37 — the draft fits each stream
+  segment as it passes (one-epoch memorization); val is the honest
+  number.
+
+**Read.**
+- vs the S3 mini-experiment (entry 18: 2.639 after 100M tokens @ 1e-4):
+  **+1.73**. Same warm-start lineage and val distribution — the delta is
+  recipe (47× tokens, 10× LR, proper warmup-to-peak), not architecture;
+  the slot choice was already settled by the search.
+- The first val (5% through, LR ~0.9e-3) already read 3.686 — above
+  every mini-experiment endpoint. Most of the mini-vs-full gap accrues
+  in the first fraction of the epoch.
+- The cool-down endpoint's 1.916 is a proxy, not a like-for-like
+  baseline: token-argmax match (token-only semantics) vs
+  verifier-argmax agreement. On this on-policy corpus (verifier-sampled)
+  they are kin in spirit but not numerically comparable.
+- No cold-start comparison exists at full scale — the fresh-2ep
+  reference died at step 1,273 of 286,582 with no checkpoints/vals.
+
+**Ops notes.** Post-run server teardown: C-c stops the API server but
+orphaned TP workers (131 GB each) survive it — kill by PID, then the
+reservation wrapper exits and the hold releases. 7.3 GB of unconsumed
+in-flight hs cache files remained after on_generate=delete consumed the
+rest; cleared. The 18T layer-ID pool retained for now.
+
+**Reproducibility:** untracked config
+`configs/qwen38-dspark-distill-regen-s3-1ep-linlr.yaml`; warm start =
+`s3-distill/warmstart` (entry 18); dataset = regen stream; run tree
+archived in `s3-distill/checkpoints/` (`speculators.patch`, `run.yaml`;
+code @ 059165b — no code changes since entry 17); checkpoints
+`{0, 0.prev1, 0.prev2, epoch0_end}`; log `s3-distill/logs/train.log`;
+trackio `qwen38-dspark-distill-regen-s3-1ep-linlr`; env unchanged.
