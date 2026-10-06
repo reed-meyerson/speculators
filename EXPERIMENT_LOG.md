@@ -827,3 +827,42 @@ archived in `s3-distill/checkpoints/` (`speculators.patch`, `run.yaml`;
 code @ 059165b — no code changes since entry 17); checkpoints
 `{0, 0.prev1, 0.prev2, epoch0_end}`; log `s3-distill/logs/train.log`;
 trackio `qwen38-dspark-distill-regen-s3-1ep-linlr`; env unchanged.
+
+### 20. 2026-10-06 — verifier hidden-state RMS grows ~400× with depth (pool measurement)
+
+**What/why.** A CPU-only pass over the entry-16 pool
+(`scripts/estimate_layer_rms.py`) measured the RMS norm of the
+verifier's hidden states as a function of layer id — the raw magnitudes
+the draft's fc consumes (hidden states enter the fc unnormalized).
+Method: seeded sample of ~1,000 tokens (50 files × 20 contiguous
+positions, lazy safetensors slice reads — no full-file loads, no GPU),
+the SAME token set for every layer; stable to ~1% across seeds
+42/7/123.
+
+**Results** (RMS over sampled (token, dim) elements; mean per-token L2
+≈ RMS × 71.5):
+
+| layer | 0 | 4 | 8 | 12 | 16 | 20 | 24 | 28 | 32 | 36 | 40 | 44 | 48 | 52 | 56 | 60 | 64 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| RMS | .014 | .34 | .48 | .67 | .83 | .85 | .92 | 1.03 | 1.13 | 1.16 | 1.24 | 1.38 | 1.58 | 2.00 | 2.83 | 3.68 | 5.66 |
+
+Monotone growth, 407× end to end, super-linear in the tail (L52→L64
+nearly triples; L60→L64 alone +54%).
+
+**Read.**
+- The layer-ID search's "depth wins" (entry 18) has a magnitude
+  counterpart: the deepest states are also the highest-energy ones —
+  the fc's per-slot signal energy tracks depth. S3 {0,36,44,52,60}
+  leans into exactly the high-energy range.
+- Layer 0's RMS (0.014 — ~25× below L4, ~250× below deep layers) is an
+  embedding-scale artifact: the model divides embeddings down hard.
+  Its slot is in every subset as the warm-start seam (entry 8), not for
+  signal energy; per-slot input scaling (or a norm ahead of the fc) is
+  an obvious future lever.
+- The steep L60→L64 jump is the readout approach: the verifier's final
+  state — the distillation target proper — is simultaneously the
+  largest-magnitude and most draft-predictive representation.
+
+**Reproducibility:** `scripts/estimate_layer_rms.py` @ this commit;
+pool per entry 16; JSON record `layer-id-search/layer_rms_sample.json`
+(seed 42); ran on CPU alongside the entry-21 token-only run.
