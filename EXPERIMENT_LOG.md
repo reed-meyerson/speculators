@@ -865,4 +865,57 @@ nearly triples; L60→L64 alone +54%).
 
 **Reproducibility:** `scripts/estimate_layer_rms.py` @ this commit;
 pool per entry 16; JSON record `layer-id-search/layer_rms_sample.json`
-(seed 42); ran on CPU alongside the entry-21 token-only run.
+(seed 42); ran on CPU alongside the in-flight token-only run (entry 22).
+
+### 21. 2026-10-06 — design note: per-slot pre-fc scaling of verifier hidden states (NOT implemented; recipe for later)
+
+**Motivation.** Entry 20: the draft's fc consumes raw verifier states
+with a ~400x per-slot RMS spread (L0 0.014 vs L60 3.68). Nothing
+normalizes the fc input (`_backbone_forward` applies `hidden_norm` only
+AFTER the projection), so the imbalance is absorbed by fc weight
+magnitudes — and since the output is immediately RMSNormed, it manifests
+as per-slot conditioning / effective-LR asymmetry (L0's columns must grow
+~250x to match deep slots' energy). Scaling every aux slot to layer-0's
+std would level the field — and, because L0's state IS the unscaled
+embedding (core.py:381) and the token-only branch feeds `embed(input_ids)`
+into the same fc, it would also make token-only -> distillation
+warm-starts distribution-consistent.
+
+**Design (agreed 2026-10-06, deliberately deferred).**
+- Scale INSIDE the model, ahead of the fc: inference inherits via
+  config.json (from_pretrained); zero changes to the data pipeline,
+  the hs server, or the 18T pool (scales apply at consume time).
+- `DFlashSpeculatorConfig.aux_hidden_state_scales: list[float] | None =
+  None`, aligned index-for-index with `aux_hidden_state_layer_ids` in
+  CONFIG order (the dataset flattens slots in config order — not sorted
+  order). `None` = raw states = every existing checkpoint loads
+  unchanged.
+- `_backbone_forward` distillation branch: reshape [1,T,n*5120] ->
+  [1,T,n,5120], multiply by the per-slot scales, flatten, then fc.
+  Token-only branch (embeddings = the reference scale) and the
+  verifier-side target construction (`verifier_norm` + L64) untouched.
+- Scales measured offline by extending `scripts/estimate_layer_rms.py`
+  with `--emit-scales` (scale_l = rms_0 / rms_l). Seed-42 values:
+  L0 1.0, L4 0.041, L8 0.029, L36 0.012, L52 0.0070, L60 0.0038.
+  L64 is never scaled (verifier target, not an aux slot).
+- `expand_target_layers.py`: propagate the field when present (new zero
+  slots: scale 1.0 or the measured value).
+- Estimated ~120-140 lines across 5 files: config ~15, core ~25, script
+  ~10, expand ~5, tests ~70 (distill path scales; token-only path
+  doesn't; teacher target untouched; order alignment; config
+  round-trip). One commit + entry.
+
+**Caveats.**
+- A function-preserving retrofit of an existing checkpoint exists —
+  fc(s*hs) == (W diag(s)) hs, so dividing slot-l fc columns by s_l and
+  setting the config scales is bit-identical — but it is NOT
+  dynamics-neutral under Muon (spectral-normalized updates see the
+  rescaled geometry), so experiments should start from a fresh fc or a
+  zero-expansion warm-start rather than a retrofit.
+- Scales are a fixed prior (measured once, ~1% sample noise across
+  seeds); per-layer RMS is a stable model property but not adaptive
+  across domains.
+
+**Trigger to implement:** any future layer-subset experiment where input
+conditioning is suspected — e.g. revisiting low-layer subsets post-S3,
+or training a fresh fc from scratch.
