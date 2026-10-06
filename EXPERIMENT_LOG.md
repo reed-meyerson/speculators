@@ -919,3 +919,69 @@ warm-starts distribution-consistent.
 **Trigger to implement:** any future layer-subset experiment where input
 conditioning is suspected — e.g. revisiting low-layer subsets post-S3,
 or training a fresh fc from scratch.
+
+### 22. 2026-10-06 — full-epoch token-only ablation complete: val eal 2.479; follow-on S3 distillation launched from it
+
+**What ran.** The entry-20-announced ablation: V16 (the FineWeb-cooldown
+warm-start, NOT the S3-pipeline cooldown) -> one full epoch of on-policy
+token-only training — layer-0 only, `ce_token`, Muon 1e-3 linear->0 over
+the epoch, 1% warmup, noise off, 8 ranks, no server. 22,040 steps
+(~4.3B tokens, one pass of the regen train stream; 196,608 nominal
+tok/step, ~95% LPT utilization), 20 mid-epoch vals on the full regen
+tail (token-only accept semantics — directly comparable to the 100M
+cooldown's 1.916). Wall 6h 50m (2026-10-06 13:59:24 -> 20:49:30 UTC,
+0.92 s/step, val pause ~52 s each). Launched + monitored via
+`canhazgpu run --gpus 8`; GPUs auto-released on exit.
+
+**Results** (final val, step 22,040): eal 2.479, p0 0.5472, p1 0.4960,
+full_acc 0.4100, accept_len 2.0059, loss 1.4967 (confidence head 0.2114).
+Trajectory: 2.022 @ 5% -> 2.290 @ 30% -> 2.408 @ 55% -> 2.470 @ 80% ->
+2.479 final; p0 0.466 -> 0.547.
+
+- **vs the 100M cooldown endpoint (1.916, same semantics): +0.563.**
+  The 43x token budget buys a real but strongly saturating gain —
+  ~50% of it lands in the first 5% of the epoch, ~80% by 30%.
+- **vs entry 19's distill final (4.372): not comparable** — hard-label
+  match vs verifier-argmax agreement. The follow-on run below measures
+  this checkpoint under distill semantics.
+
+**Forecast verification.** Saturating-curve fits (exp-approach, power,
+sat-power, log, geometric-gain-decay) with per-family bias correction
+calibrated on the entry-19 distill run's own first-N vals (known final)
+predicted 2.48 +- 0.02 eal / 0.546 +- 0.003 p0 at the 80% mark; actuals
+2.479 / 0.547. The shape-transfer estimate (distill covered 99.1% of
+its eal gain by 80%) was the most accurate single predictor. The
+forecast history across updates (2.42 -> 2.43 -> 2.45 -> 2.46 -> 2.47 ->
+2.48) converged monotonically to the truth — useful procedure to reuse.
+
+**Follow-on launched: full 1-epoch S3 distillation from THIS endpoint.**
+Identical recipe to entry 19 (stream, geometry 8192/1024, ce 0.1/tv 0.9,
+Muon 1e-3, linear with cold-parity warmup 2,867 steps, noise off,
+143,291 steps = one epoch, ckpt+val every 7,165 steps keep 3) — the ONLY
+change is the warm start:
+
+  entry 19: V16 -> 100M-token token-only cooldown -> expand -> distill
+  this run: V16 -> FULL-EPOCH token-only (this entry) -> expand -> distill
+
+This isolates the token-only stage's budget: does 4.3B tokens of
+token-only pretraining beat 100M once the teacher epoch runs, and where
+does the combined pipeline land vs 4.372?
+
+- Expansion verified (same protocol as entry 18): slot-0 fc block
+  bit-exact vs the token-only endpoint, 4 zero blocks (layers 36/44/52/
+  60), config aux ids [0, 36, 44, 52, 60]; warmstart at
+  `tokenonly-s3distill/warmstart`.
+- Server: TP4 vLLM hs server (max-model-len 8200) via
+  `canhazgpu run --gpus 4`, healthy in ~2.3 min (JIT cache warm).
+- Training: 4 ranks via `canhazgpu run --gpus 4`, launched 2026-10-06
+  20:53 UTC. Verified healthy: 0.91 s/step (matches entry 19's 0.92),
+  LR exactly on the 2,867-step warmup ramp, hs fetch_ms ~15-37,
+  error_records 0. ETA ~44 h -> ~2026-10-08 17:00 UTC.
+
+**Reproducibility:** configs `configs/qwen38-dspark-tokenonly-regen-1ep.yaml`
+(entry-22 run) and `configs/qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly.yaml`
+(follow-on); outputs `onpolicy-tokenonly-1ep/` (checkpoints epoch0_end ->
+0, keep-3, val_metrics.json) and `tokenonly-s3distill/{warmstart,
+checkpoints,logs,hidden-states}`; trackio runs
+`qwen38-dspark-tokenonly-regen-1ep` and
+`qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly`; code @ this commit.
