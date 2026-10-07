@@ -31,6 +31,15 @@ Usage:
         --new-target-layer-ids 0 4 12 20 28 36 44 52 60 \
         --output OUT_DIR
 
+Optionally set per-slot pre-fc input scales (entry 21) on the output config:
+    ... --slot-scales 1.0 0.012 0.010 0.007 0.0038
+aligned index-for-index with --new-target-layer-ids. When omitted, the
+source config's aux_hidden_state_scales (if any) are propagated to their
+slots' new positions and NEW slots default to 1.0. Function preservation
+of the warm start holds when every OLD (nonzero) slot's scale is unchanged
+(the typical case: layer 0 keeps 1.0, the reference RMS); the script warns
+when an old slot's effective scale changes.
+
 Note for the stage-2 run itself: include layer 0 in the new ids (that is
 where the pretrained weights live) and launch the verifier hidden-states
 server with the same id list (``launch_vllm.py --target-layer-ids ...``).
@@ -90,6 +99,17 @@ def main() -> None:
         required=True,
         help="new target layer ids, in concat order (must include every old id)",
     )
+    parser.add_argument(
+        "--slot-scales",
+        type=float,
+        nargs="+",
+        default=None,
+        help=(
+            "per-slot pre-fc input scales for the OUTPUT config, aligned "
+            "index-for-index with --new-target-layer-ids (entry 21). "
+            "Omitted: propagate the source config's scales (new slots 1.0)."
+        ),
+    )
     parser.add_argument("--output", type=Path, required=True, help="output dir")
     args = parser.parse_args()
 
@@ -124,9 +144,52 @@ def main() -> None:
 
     state_dict[FC_KEY] = expand_fc(old_weight, old_ids, args.new_target_layer_ids, hidden_size)
 
+    # Resolve output scales (entry 21): explicit --slot-scales win; else
+    # propagate the source's scales with new slots defaulting to 1.0.
+    old_scales = config.get("aux_hidden_state_scales")
+    if args.slot_scales is not None:
+        if len(args.slot_scales) != len(args.new_target_layer_ids):
+            raise SystemExit(
+                f"--slot-scales has {len(args.slot_scales)} values but "
+                f"--new-target-layer-ids has {len(args.new_target_layer_ids)}; "
+                "they must align index-for-index."
+            )
+        new_scales = list(args.slot_scales)
+    elif old_scales is not None:
+        if len(old_scales) != len(old_ids):
+            raise SystemExit(
+                f"source config aux_hidden_state_scales has {len(old_scales)} "
+                f"entries but aux_hidden_state_layer_ids has {len(old_ids)}."
+            )
+        new_scales = [
+            old_scales[old_ids.index(i)] if i in old_ids else 1.0
+            for i in args.new_target_layer_ids
+        ]
+    else:
+        new_scales = None
+
+    if new_scales is not None:
+        # Warm-start function preservation: an old slot's fc block was
+        # trained under its source effective scale (1.0 when the source had
+        # no scales). If the output rescales that slot, the warm start is
+        # NOT function-preserving on it (fine for zero-expansion slots,
+        # questionable for pretrained ones — see entry 21's caveat).
+        for old_id in old_ids:
+            src_eff = old_scales[old_ids.index(old_id)] if old_scales else 1.0
+            out_eff = new_scales[args.new_target_layer_ids.index(old_id)]
+            if out_eff != src_eff:
+                print(
+                    f"WARNING: old slot layer {old_id} effective scale changes "
+                    f"{src_eff} -> {out_eff}; the warm start is NOT "
+                    "function-preserving on this slot's pretrained fc block.",
+                    file=sys.stderr,
+                )
+
     args.output.mkdir(parents=True, exist_ok=True)
     save_file(state_dict, args.output / "model.safetensors")
     config["aux_hidden_state_layer_ids"] = list(args.new_target_layer_ids)
+    if new_scales is not None:
+        config["aux_hidden_state_scales"] = new_scales
     (args.output / "config.json").write_text(json.dumps(config, indent=2))
     if (ckpt / "config.py").is_file():
         shutil.copy(ckpt / "config.py", args.output / "config.py")
@@ -136,6 +199,7 @@ def main() -> None:
         f"Expanded {FC_KEY}: {tuple(old_weight.shape)} -> "
         f"({hidden_size}, {n_new * hidden_size}) "
         f"(old ids {old_ids} -> new ids {list(args.new_target_layer_ids)}); "
+        f"scales={new_scales if new_scales is not None else 'none'}; "
         f"wrote {args.output}"
     )
 

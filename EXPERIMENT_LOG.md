@@ -1004,3 +1004,89 @@ ApiServer worker whose cmdline matched the regex, and the caller's own
 shell). Intended outcome (full teardown) but wrong mechanism — kill
 run processes by exact pattern or PID, and C-c the tmux windows (which
 worked cleanly for torchrun).
+
+### 23. 2026-10-07 — entry-21 per-slot pre-fc input scaling implemented; normalized S3 distillation launched from the token-only endpoint
+
+**What was built.** The entry-21 design, implemented exactly as specified:
+`DFlashSpeculatorConfig.aux_hidden_state_scales: list[float] | None`
+(aligned index-for-index with `aux_hidden_state_layer_ids` in CONFIG
+order; validated positive + length-matched; `None` = raw states = every
+existing checkpoint loads unchanged), applied ONLY in the
+`_backbone_forward` distillation branch — reshape [1,T,n*5120] ->
+[1,T,n,5120], multiply by the per-slot scales, flatten, then fc. The
+token-only (embedding) branch and the verifier-side target construction
+are untouched. Inference inherits the scales via config.json
+(from_pretrained), so the data pipeline, hs server, and 18T pool are
+unmodified — scales apply at consume time. Tooling:
+`estimate_layer_rms.py --emit-scales` (scale_l = rms(lowest id)/rms_l,
+recorded in the JSON) and `expand_target_layers.py --slot-scales`
+(aligned with the new ids; when omitted, propagates source scales with
+new slots at 1.0; warns when an old slot's effective scale changes —
+NOT function-preserving).
+
+**Engineering note (meta-device init).** First implementation registered
+a non-persistent fp32 buffer — and from_pretrained loaded it as
+UNINITIALIZED memory (garbage values): transformers 5.x constructs
+models under a `torch.device("meta")` context, where tensors created in
+`__init__` land on meta and `to_empty()` later materializes anything
+absent from the checkpoint (non-persistent buffers are, by design) as
+uninitialized bits. Fix: the scale tensor is now derived from the CONFIG
+at forward time (`_aux_scale_tensor`, lazily cached in `__dict__` keyed
+by device/dtype) — config is the single source of truth and is immune
+to meta init. Regression test simulates the exact failure (meta-context
+construct + to_empty + check). Lesson: never register config-derived
+constants as buffers in this codebase.
+
+**Scales measured** (seed 42, `layer-id-search/layer_rms_sample_s3scales.json`,
+from the entry-16 pool): for S3 ids [0, 36, 44, 52, 60] ->
+[1.0, 0.01197847, 0.01005724, 0.00696475, 0.00377651]. L44 = 0.01005724
+(rms 1.3817) — the one value missing from entry 21's table.
+
+**Verification before launch.**
+- 9 new unit tests (`tests/unit/models/test_dflash_aux_scales.py`):
+  distill-path scaling in config order (unsorted ids [4,0]), token-only
+  path unaffected (non-unity scale on single-slot), verifier targets
+  untouched, config validator, meta-init survival, config round-trip
+  via save_pretrained/from_pretrained, expand script scales/propagation/
+  warning via subprocess.
+- Full suite: 265 passed (tests/unit/models + test_config), run under
+  `canhazgpu run` (CUDA-dependent tests included).
+- Real warmstart end-to-end: from_pretrained loads scales [1.0, 0.012,
+  0.010, 0.007, 0.0038]; eager forward == manual pre-scaling of slot
+  blocks (max logits diff 0.0); compiled forward on CUDA bf16 works,
+  deterministic, compiled == eager (0.0) — compile compatibility of the
+  new ops confirmed before the multi-day launch.
+- Expansion verified (entry-18/22 protocol): slot-0 fc block bit-exact
+  vs the token-only endpoint (scale 1.0 keeps the warm start
+  function-preserving — zero-expansion satisfies entry-21's Muon
+  caveat), 4 zero blocks (36/44/52/60), all 61 non-fc weights identical,
+  config ids+scales present. Warmstart at
+  `tokenonly-s3distill-norm/warmstart`.
+
+**Run launched.** Entry-22's ablation re-run WITH normalization: full
+1-epoch on-policy S3 distillation from the token-only full-epoch
+endpoint (eal 2.479), scales active. Identical recipe to entry 19 /
+the killed follow-on (stream, geometry 8192/1024, ce 0.1/tv 0.9, Muon
+1e-3, linear LR with cold-parity warmup 2,867 steps, noise off,
+143,291 steps = one epoch, ckpt+val every 7,165 keep 3) — the ONLY
+change is per-slot pre-fc scaling.
+
+- Question: does leveling the ~400x per-slot RMS spread at the fc input
+  beat the un-normalized trajectory (killed follow-on: parity with
+  entry 19's 4.372, projected ~4.21; entry 19 = 4.372)?
+- Server: TP4 vLLM hs server (S3 ids, max-model-len 8200) via
+  `canhazgpu run --gpus 4`, healthy in ~150 s.
+- Training: 4 ranks via `canhazgpu run --gpus 4`, launched 2026-10-07
+  14:18 UTC (tmux `tokenonly-s3distill-norm`). Verified healthy at step
+  200: LR exactly on the 2,867-step warmup ramp (6.98e-05), Muon params
+  36/26 (identical to the un-normalized run — same shapes),
+  error_records 0, fetch_ms ~15. Step rate 0.66 s/step (faster than
+  the 0.91-0.92 family — ETA ~26 h at this rate vs 36-44 h prior;
+  monitor).
+
+**Reproducibility:** config
+`configs/qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly-norm.yaml`;
+scales JSON `layer-id-search/layer_rms_sample_s3scales.json`; outputs
+`tokenonly-s3distill-norm/{warmstart,checkpoints,logs,hidden-states}`;
+trackio run `qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly-norm`;
+code @ this commit.

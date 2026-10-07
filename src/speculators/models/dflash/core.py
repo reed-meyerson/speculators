@@ -124,6 +124,16 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
             config.transformer_layer_config.hidden_size,
             bias=False,
         )
+        # Entry 21: per-slot pre-fc input scales (config.aux_hidden_state_scales)
+        # are applied ONLY in the distillation branch of _backbone_forward,
+        # never to the token-only (embedding) branch or the verifier-side
+        # target construction. The tensor is built lazily from the CONFIG (see
+        # _aux_scale_tensor) rather than registered as a buffer:
+        # transformers' from_pretrained constructs models under meta-device
+        # init, where register_buffer produces meta tensors that to_empty()
+        # later materializes as UNINITIALIZED memory for anything absent from
+        # the checkpoint (non-persistent buffers are, by design). The config
+        # object is always real, so it is the single source of truth.
         self.hidden_norm = Qwen3RMSNorm(
             config.transformer_layer_config.hidden_size,
             eps=config.transformer_layer_config.rms_norm_eps,  # type: ignore[arg-type]
@@ -167,6 +177,31 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
     def target_layer_ids(self) -> list[int]:
         """Target layer IDs for auxiliary hidden states."""
         return self.config.aux_hidden_state_layer_ids
+
+    def _aux_scale_tensor(self, device: torch.device, dtype: torch.dtype):
+        """Lazily cached [1, 1, num_slots, 1] scale tensor for the fc input.
+
+        Built from ``config.aux_hidden_state_scales`` (None -> returns None,
+        meaning: no scaling). Cached in ``__dict__`` keyed implicitly by the
+        requested (device, dtype); a plain tensor attribute so meta-device
+        model init / ``to_empty()`` never touches it.
+        """
+        scales = self.config.aux_hidden_state_scales
+        if scales is None:
+            return None
+        cached = self.__dict__.get("_aux_input_scales_cache")
+        if (
+            cached is None
+            or cached.device != device
+            or cached.dtype != dtype
+        ):
+            cached = (
+                torch.tensor(scales, device=device, dtype=dtype)
+                .view(1, 1, len(scales), 1)
+                .contiguous()
+            )
+            self.__dict__["_aux_input_scales_cache"] = cached
+        return cached
 
     def load_verifier_weights(self):
         """Reconstruct weights intentionally omitted from DFlash checkpoints."""
@@ -455,6 +490,22 @@ class DFlashDraftModel(DraftVocabMixin, SpeculatorModel):
                 " (--loss-fn ce_token --target-layer-ids 0)."
             )
         else:
+            aux_scales = self._aux_scale_tensor(
+                hidden_states.device, hidden_states.dtype
+            )
+            if aux_scales is not None:
+                # Entry 21: scale each aux slot to a common RMS before the fc.
+                # The flattened input is slot-major in config order, so
+                # reinterpret as [..., num_slots, hidden] and broadcast-multiply.
+                # The token-only branch above and the verifier target path
+                # below are deliberately untouched.
+                num_slots = len(self.target_layer_ids)
+                hidden_states = (
+                    hidden_states.reshape(
+                        *hidden_states.shape[:-1], num_slots, -1
+                    )
+                    * aux_scales
+                ).flatten(-2)
             fc_output = self.fc(hidden_states)
         fc_output = self.hidden_norm(fc_output)
         # shape: [1, total_seq_len, hidden_size]

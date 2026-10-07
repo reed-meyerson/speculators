@@ -1,6 +1,6 @@
 from typing import Any, Literal
 
-from pydantic import Field, field_serializer, field_validator
+from pydantic import Field, field_serializer, field_validator, model_validator
 from transformers import AutoConfig, PretrainedConfig
 from transformers.models.qwen3.modeling_qwen3 import (
     Qwen3Config,
@@ -58,6 +58,21 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
         description="Layer IDs of the DFlash auxiliary hidden state layers",
     )
 
+    aux_hidden_state_scales: list[float] | None = Field(
+        default=None,
+        description=(
+            "Per-slot pre-fc input scales, aligned index-for-index with "
+            "aux_hidden_state_layer_ids in CONFIG order (not sorted). Applied "
+            "to the distillation branch only (the token-only branch feeds "
+            "embeddings, and the verifier-side target construction is never "
+            "scaled). None = raw states; every existing checkpoint loads "
+            "unchanged. Typical use: scale_l = rms(layer 0) / rms(layer l), "
+            "measured offline on a captured pool (see "
+            "scripts/estimate_layer_rms.py --emit-scales), to level the ~400x "
+            "per-slot RMS spread of verifier hidden states before the fc."
+        ),
+    )
+
     mask_token_id: int | None = Field(
         default=None,
         description="Token ID used for masking",
@@ -98,6 +113,31 @@ class DFlashSpeculatorConfig(SpeculatorModelConfig):
                 ).__class__
             return config_class(**value)
         return value
+
+    @model_validator(mode="after")
+    def validate_aux_scales(self) -> "DFlashSpeculatorConfig":
+        """Scales must be positive and aligned with the layer-id list."""
+        scales = self.aux_hidden_state_scales
+        if scales is None:
+            return self
+        ids = self.aux_hidden_state_layer_ids
+        if ids is None:
+            raise ValueError(
+                "aux_hidden_state_scales requires aux_hidden_state_layer_ids "
+                "to be set."
+            )
+        if len(scales) != len(ids):
+            raise ValueError(
+                f"aux_hidden_state_scales has {len(scales)} entries but "
+                f"aux_hidden_state_layer_ids has {len(ids)}; they must be "
+                "aligned index-for-index in config order."
+            )
+        bad = [s for s in scales if s <= 0]
+        if bad:
+            raise ValueError(
+                f"aux_hidden_state_scales must be strictly positive; got {bad}."
+            )
+        return self
 
     @property
     def target_vocab_size(self) -> int:

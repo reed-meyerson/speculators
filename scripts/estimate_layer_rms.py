@@ -54,6 +54,18 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--seed", type=int, default=42)
     p.add_argument(
+        "--emit-scales",
+        type=int,
+        nargs="+",
+        default=None,
+        help=(
+            "layer ids to emit pre-fc input scales for (scale_l = "
+            "rms(lowest layer id) / rms(l), typically rms_0 / rms_l). "
+            "Included in the JSON output and printed as a copy-pasteable "
+            "list in the requested order."
+        ),
+    )
+    p.add_argument(
         "--output", type=Path, default=None,
         help="optional JSON output path for the results table",
     )
@@ -133,26 +145,42 @@ def main() -> None:
     report = "\n".join(lines)
     print(report)
 
+    scales_out = None
+    if args.emit_scales:
+        missing = [l for l in args.emit_scales if l not in layer_ids]
+        if missing:
+            raise SystemExit(
+                f"--emit-scales requested layer ids {missing} not present in "
+                f"the pool manifest layer_ids {layer_ids}."
+            )
+        scales_out = {l: rms0 / rms[layer_ids.index(l)].item() for l in args.emit_scales}
+        print("\npre-fc input scales (scale_l = rms_L%d / rms_l):" % layer_ids[order[0]])
+        print(
+            "  "
+            + " ".join(f"{l}:{scales_out[l]:.8f}" for l in args.emit_scales)
+        )
+        print(
+            "  as a list in the requested order "
+            f"{args.emit_scales}:\n  {[round(scales_out[l], 8) for l in args.emit_scales]}"
+        )
+
     if args.output:
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        args.output.write_text(
-            json.dumps(
-                {
-                    "pool_dir": str(args.pool_dir),
-                    "seed": args.seed,
-                    "num_tokens": n_tokens,
-                    "num_files": n_files,
-                    "hidden_size": hidden,
-                    "layer_ids": layer_ids,
-                    "rms": {layer_ids[i]: rms[i].item() for i in order},
-                    "mean_token_l2": {
-                        layer_ids[i]: mean_l2[i].item() for i in order
-                    },
-                },
-                indent=2,
-            )
-            + "\n"
-        )
+        out = {
+            "pool_dir": str(args.pool_dir),
+            "seed": args.seed,
+            "num_tokens": n_tokens,
+            "num_files": n_files,
+            "hidden_size": hidden,
+            "layer_ids": layer_ids,
+            "rms": {layer_ids[i]: rms[i].item() for i in order},
+            "mean_token_l2": {
+                layer_ids[i]: mean_l2[i].item() for i in order
+            },
+        }
+        if scales_out is not None:
+            out["pre_fc_scales"] = scales_out
+        args.output.write_text(json.dumps(out, indent=2) + "\n")
         print(f"\nwrote {args.output}")
 
 
