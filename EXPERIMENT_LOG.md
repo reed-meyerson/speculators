@@ -1090,3 +1090,24 @@ scales JSON `layer-id-search/layer_rms_sample_s3scales.json`; outputs
 `tokenonly-s3distill-norm/{warmstart,checkpoints,logs,hidden-states}`;
 trackio run `qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly-norm`;
 code @ this commit.
+
+**Update (abort).** Killed at step 1,468 (~1% of the epoch, 23 min in,
+2026-10-07 14:41 UTC) on user decision — before the first val
+(7,165). Read: train-batch eal at matched steps ran consistently
+at-or-below the un-normalized follow-on (step 0: 2.750 vs 2.751 —
+runtime confirmation of the bit-exact warm-start; then 400: 2.556 vs
+2.526, 800: 2.520 vs 2.706, 1000: 3.029 vs 3.189, 1200: 2.682 vs
+2.884, 1400: 2.543 vs 2.720) — no early edge from leveling the
+per-slot RMS spread; if anything slightly below. Train-batch eal is
+noisy (both runs wobble 2.3-3.2 at these steps) but 1,400 matched
+steps of overlap showed no sign of the expected improvement, and the
+un-normalized run's own history (parity with entry 19) said the
+remaining ~35 h was unlikely to pay. Conclusion: entry-21's input-RMS
+leveling shows no benefit under this recipe/warm-start; the fc (or
+Muon) adapts to the raw ~400x spread quickly enough that the fixed
+scaling prior adds nothing — consistent with the follow-on having
+already reached entry-19 parity without it. Both reservations released
+cleanly (C-c both tmux windows; 8/8 AVAILABLE, baseline memory, no
+orphans); keep-3 checkpoints unaffected (none written this early);
+warmstart + logs + the (empty) hs cache preserved under
+`tokenonly-s3distill-norm/`.
