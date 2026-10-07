@@ -985,3 +985,22 @@ does the combined pipeline land vs 4.372?
 checkpoints,logs,hidden-states}`; trackio runs
 `qwen38-dspark-tokenonly-regen-1ep` and
 `qwen38-dspark-distill-s3-1ep-linlr-fromtokenonly`; code @ this commit.
+
+**Update (abort).** Killed at 35% (step 50,702, 2026-10-07) on user
+decision. Seven vals in, the warm-start ablation had answered its
+question: a consistent but shrinking lead over entry 19 —
++0.041 / +0.029 / +0.024 / +0.024 / +0.021 / +0.020 / +0.019 eal at
+5-35% (3.727 -> 4.210 vs 3.686 -> 4.191 at identical boundaries).
+Gap decay ~0.003/boundary projects final ~= parity with entry 19's
+4.372 — the 43x-larger token-only budget before the distill epoch buys
+~+0.02 mid-run but not a better endpoint. Not worth the remaining ~29 h.
+Both reservations released cleanly (8/8 AVAILABLE, baseline memory);
+keep-3 checkpoints from 25/30/35% preserved under
+`tokenonly-s3distill/checkpoints/`.
+
+Ops note: the server went down via an over-broad `pkill -9 -f
+"speculators.train"` (dots match any char; it SIGKILL'd a vLLM
+ApiServer worker whose cmdline matched the regex, and the caller's own
+shell). Intended outcome (full teardown) but wrong mechanism — kill
+run processes by exact pattern or PID, and C-c the tmux windows (which
+worked cleanly for torchrun).
